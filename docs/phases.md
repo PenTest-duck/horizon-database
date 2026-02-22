@@ -72,4 +72,4 @@
 - [x] SQL dump import/export
 - [x] Performance benchmarks (Criterion)
 - [x] Comprehensive test suite (645 tests)
-- [ ] Documentation
+- [x] Documentation
