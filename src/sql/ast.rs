@@ -15,6 +15,10 @@ pub enum Statement {
     DropTable(DropTableStatement),
     CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
+    CreateView(CreateViewStatement),
+    DropView(DropViewStatement),
+    CreateTrigger(CreateTriggerStatement),
+    DropTrigger(DropTriggerStatement),
     AlterTable(AlterTableStatement),
     Explain(Box<Statement>),
     Pragma(PragmaStatement),
@@ -23,9 +27,10 @@ pub enum Statement {
     Rollback,
 }
 
-/// A `SELECT` statement.
+/// A `SELECT` statement, possibly with CTEs and compound operators.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
+    pub ctes: Vec<Cte>,
     pub distinct: bool,
     pub columns: Vec<SelectColumn>,
     pub from: Option<FromClause>,
@@ -35,6 +40,44 @@ pub struct SelectStatement {
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<Expr>,
     pub offset: Option<Expr>,
+    /// UNION / INTERSECT / EXCEPT chain (applied after this select body).
+    pub compound: Vec<CompoundOp>,
+}
+
+/// A Common Table Expression: `name [(col1, col2)] AS (select)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: String,
+    pub columns: Option<Vec<String>>,
+    pub query: SelectStatement,
+    pub recursive: bool,
+}
+
+/// A compound SELECT operator with its second operand.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompoundOp {
+    pub op: CompoundType,
+    pub select: SelectBody,
+}
+
+/// The type of compound query.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CompoundType {
+    Union,
+    UnionAll,
+    Intersect,
+    Except,
+}
+
+/// A single SELECT body (the core part without CTEs or trailing compounds).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectBody {
+    pub distinct: bool,
+    pub columns: Vec<SelectColumn>,
+    pub from: Option<FromClause>,
+    pub where_clause: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
 }
 
 /// A single item in the SELECT column list.
@@ -168,6 +211,58 @@ pub enum AlterTableAction {
     DropColumn(String),
 }
 
+/// A `CREATE VIEW` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateViewStatement {
+    pub name: String,
+    pub columns: Option<Vec<String>>,
+    pub query: SelectStatement,
+    pub if_not_exists: bool,
+}
+
+/// A `DROP VIEW` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropViewStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+/// A `CREATE TRIGGER` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTriggerStatement {
+    pub name: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub table: String,
+    pub for_each_row: bool,
+    pub when: Option<Expr>,
+    pub body: Vec<Statement>,
+    pub if_not_exists: bool,
+}
+
+/// When the trigger fires relative to the event.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+    InsteadOf,
+}
+
+/// The event that activates a trigger.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerEvent {
+    Insert,
+    Update(Option<Vec<String>>),
+    Delete,
+}
+
+/// A `DROP TRIGGER` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTriggerStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
 /// A `PRAGMA` statement — SQLite-compatible configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PragmaStatement {
@@ -285,6 +380,7 @@ mod tests {
     #[test]
     fn select_statement_default_fields() {
         let stmt = SelectStatement {
+            ctes: vec![],
             distinct: false,
             columns: vec![SelectColumn::AllColumns],
             from: Some(FromClause::Table {
@@ -297,6 +393,7 @@ mod tests {
             order_by: vec![],
             limit: None,
             offset: None,
+            compound: vec![],
         };
         assert!(!stmt.distinct);
         assert_eq!(stmt.columns.len(), 1);

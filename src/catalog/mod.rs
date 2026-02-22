@@ -270,6 +270,216 @@ impl Catalog {
             .collect()
     }
 
+    /// Rename a table in the catalog.
+    ///
+    /// Updates the in-memory catalog and persists the change to the schema
+    /// B+Tree. The old key is removed and a new key is inserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HorizonError::TableNotFound`] if the source table does not
+    /// exist, or [`HorizonError::DuplicateTable`] if the target name is
+    /// already taken.
+    pub fn rename_table(&mut self, pool: &mut BufferPool, old_name: &str, new_name: &str) -> Result<()> {
+        if !self.tables.contains_key(old_name) {
+            return Err(HorizonError::TableNotFound(old_name.into()));
+        }
+        if self.tables.contains_key(new_name) {
+            return Err(HorizonError::DuplicateTable(new_name.into()));
+        }
+
+        // Remove the old entry from the schema B+Tree
+        let schema_root = pool.pager().schema_root();
+        if schema_root != 0 {
+            let mut tree = BTree::open(schema_root);
+            let old_key = format!("table:{}", old_name);
+            tree.delete(pool, old_key.as_bytes())?;
+            if tree.root_page() != schema_root {
+                pool.pager_mut().set_schema_root(tree.root_page())?;
+            }
+        }
+
+        // Update the in-memory table
+        let mut table = self.tables.remove(old_name).unwrap();
+        table.name = new_name.to_string();
+
+        // Update any indexes that reference this table
+        for idx in self.indexes.values_mut() {
+            if idx.table_name == old_name {
+                idx.table_name = new_name.to_string();
+            }
+        }
+
+        // Persist the renamed table
+        let schema_root = pool.pager().schema_root();
+        if schema_root != 0 {
+            let mut tree = BTree::open(schema_root);
+            let new_key = format!("table:{}", new_name);
+            let value = Self::serialize_table(&table);
+            tree.insert(pool, new_key.as_bytes(), &value)?;
+            if tree.root_page() != schema_root {
+                pool.pager_mut().set_schema_root(tree.root_page())?;
+            }
+        }
+
+        self.tables.insert(new_name.to_string(), table);
+        Ok(())
+    }
+
+    /// Add a column to an existing table in the catalog.
+    ///
+    /// This is a metadata-only operation: existing rows are not rewritten.
+    /// Reads of existing rows will NULL-pad the missing column value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HorizonError::TableNotFound`] if the table does not exist,
+    /// or [`HorizonError::DuplicateColumn`] if a column with the same name
+    /// already exists.
+    pub fn add_column(&mut self, pool: &mut BufferPool, table_name: &str, col: ColumnInfo) -> Result<()> {
+        let table = self.tables.get_mut(table_name)
+            .ok_or_else(|| HorizonError::TableNotFound(table_name.into()))?;
+
+        // Check for duplicate column name
+        if table.find_column(&col.name).is_some() {
+            return Err(HorizonError::DuplicateColumn(col.name.clone()));
+        }
+
+        table.columns.push(col);
+
+        // Persist to schema B+Tree
+        let updated = table.clone();
+        let schema_root = pool.pager().schema_root();
+        if schema_root != 0 {
+            let mut tree = BTree::open(schema_root);
+            let key = format!("table:{}", table_name);
+            let value = Self::serialize_table(&updated);
+            tree.insert(pool, key.as_bytes(), &value)?;
+            if tree.root_page() != schema_root {
+                pool.pager_mut().set_schema_root(tree.root_page())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Rename a column in an existing table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HorizonError::TableNotFound`] if the table does not exist,
+    /// [`HorizonError::ColumnNotFound`] if the old column name does not exist,
+    /// or [`HorizonError::DuplicateColumn`] if the new column name is already
+    /// taken.
+    pub fn rename_column(&mut self, pool: &mut BufferPool, table_name: &str, old_col: &str, new_col: &str) -> Result<()> {
+        let table = self.tables.get_mut(table_name)
+            .ok_or_else(|| HorizonError::TableNotFound(table_name.into()))?;
+
+        // Check new name is not already in use
+        if table.find_column(new_col).is_some() {
+            return Err(HorizonError::DuplicateColumn(new_col.into()));
+        }
+
+        let col_idx = table.find_column_index(old_col)
+            .ok_or_else(|| HorizonError::ColumnNotFound(format!("{}.{}", table_name, old_col)))?;
+
+        table.columns[col_idx].name = new_col.to_string();
+
+        // Also update any indexes that reference this column
+        for idx in self.indexes.values_mut() {
+            if idx.table_name == table_name {
+                for col_name in &mut idx.columns {
+                    if col_name.eq_ignore_ascii_case(old_col) {
+                        *col_name = new_col.to_string();
+                    }
+                }
+            }
+        }
+
+        // Persist
+        let updated = table.clone();
+        let schema_root = pool.pager().schema_root();
+        if schema_root != 0 {
+            let mut tree = BTree::open(schema_root);
+            let key = format!("table:{}", table_name);
+            let value = Self::serialize_table(&updated);
+            tree.insert(pool, key.as_bytes(), &value)?;
+            if tree.root_page() != schema_root {
+                pool.pager_mut().set_schema_root(tree.root_page())?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Drop a column from an existing table (metadata-only).
+    ///
+    /// Existing rows are not rewritten; the column position simply becomes
+    /// inaccessible. This is a "lazy" approach.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HorizonError::TableNotFound`] if the table does not exist,
+    /// or [`HorizonError::ColumnNotFound`] if the column does not exist.
+    /// Dropping a primary key column is not allowed.
+    pub fn drop_column(&mut self, pool: &mut BufferPool, table_name: &str, col_name: &str) -> Result<()> {
+        let table = self.tables.get_mut(table_name)
+            .ok_or_else(|| HorizonError::TableNotFound(table_name.into()))?;
+
+        let col_idx = table.find_column_index(col_name)
+            .ok_or_else(|| HorizonError::ColumnNotFound(format!("{}.{}", table_name, col_name)))?;
+
+        // Do not allow dropping the primary key column
+        if table.columns[col_idx].primary_key {
+            return Err(HorizonError::InvalidSql(
+                format!("cannot drop PRIMARY KEY column: {}", col_name)
+            ));
+        }
+
+        table.columns.remove(col_idx);
+
+        // Re-number positions
+        for (i, c) in table.columns.iter_mut().enumerate() {
+            c.position = i;
+        }
+
+        // Update pk_column index if necessary
+        if let Some(pk) = table.pk_column {
+            if col_idx < pk {
+                table.pk_column = Some(pk - 1);
+            } else if col_idx == pk {
+                // Should not reach here (guarded above), but safety
+                table.pk_column = None;
+            }
+        }
+
+        // Remove any indexes that reference the dropped column
+        let to_remove: Vec<String> = self.indexes.iter()
+            .filter(|(_, idx)| {
+                idx.table_name == table_name && idx.columns.iter().any(|c| c.eq_ignore_ascii_case(col_name))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for idx_name in to_remove {
+            self.indexes.remove(&idx_name);
+        }
+
+        // Persist
+        let updated = table.clone();
+        let schema_root = pool.pager().schema_root();
+        if schema_root != 0 {
+            let mut tree = BTree::open(schema_root);
+            let key = format!("table:{}", table_name);
+            let value = Self::serialize_table(&updated);
+            tree.insert(pool, key.as_bytes(), &value)?;
+            if tree.root_page() != schema_root {
+                pool.pager_mut().set_schema_root(tree.root_page())?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Update the persisted metadata for a table (e.g. after advancing
     /// `next_rowid` during INSERT).
     pub fn update_table_meta(&mut self, pool: &mut BufferPool, name: &str, table: &TableInfo) -> Result<()> {

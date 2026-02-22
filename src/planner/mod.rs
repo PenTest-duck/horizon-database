@@ -107,6 +107,10 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<LogicalPlan
         Statement::Begin => Ok(LogicalPlan::Begin),
         Statement::Commit => Ok(LogicalPlan::Commit),
         Statement::Rollback => Ok(LogicalPlan::Rollback),
+        Statement::CreateView(_) => Err(HorizonError::NotImplemented("CREATE VIEW".into())),
+        Statement::DropView(_) => Err(HorizonError::NotImplemented("DROP VIEW".into())),
+        Statement::CreateTrigger(_) => Err(HorizonError::NotImplemented("CREATE TRIGGER".into())),
+        Statement::DropTrigger(_) => Err(HorizonError::NotImplemented("DROP TRIGGER".into())),
     }
 }
 

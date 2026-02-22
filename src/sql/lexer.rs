@@ -121,6 +121,11 @@ pub enum Token {
     Escape,
     True,
     False,
+    Before,
+    After,
+    Instead,
+    For,
+    Of,
 
     // -----------------------------------------------------------------------
     // Literals
@@ -286,6 +291,11 @@ fn keyword_token(word: &str) -> Option<Token> {
         "ESCAPE" => Some(Token::Escape),
         "TRUE" => Some(Token::True),
         "FALSE" => Some(Token::False),
+        "BEFORE" => Some(Token::Before),
+        "AFTER" => Some(Token::After),
+        "INSTEAD" => Some(Token::Instead),
+        "FOR" => Some(Token::For),
+        "OF" => Some(Token::Of),
         _ => None,
     }
 }

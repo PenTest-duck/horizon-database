@@ -129,6 +129,11 @@ impl Parser {
             Token::Attach => "attach",
             Token::Detach => "detach",
             Token::Trigger => "trigger",
+            Token::Before => "before",
+            Token::After => "after",
+            Token::Instead => "instead",
+            Token::For => "for",
+            Token::Of => "of",
             Token::Begin => "begin",
             Token::End => "end",
             Token::To => "to",
@@ -148,7 +153,7 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement> {
         match self.current() {
-            Token::Select => self.parse_select_stmt(),
+            Token::Select | Token::With => self.parse_select_stmt(),
             Token::Insert | Token::Replace => self.parse_insert(),
             Token::Update => self.parse_update(),
             Token::Delete => self.parse_delete(),
@@ -190,10 +195,108 @@ impl Parser {
     // =======================================================================
 
     fn parse_select_stmt(&mut self) -> Result<Statement> {
-        Ok(Statement::Select(self.parse_select()?))
+        Ok(Statement::Select(self.parse_select_full()?))
     }
 
-    fn parse_select(&mut self) -> Result<SelectStatement> {
+    /// Parse a full SELECT including optional WITH (CTEs) prefix.
+    fn parse_select_full(&mut self) -> Result<SelectStatement> {
+        // Parse optional CTEs: WITH [RECURSIVE] name AS (select), ...
+        let ctes = if self.current() == &Token::With {
+            self.advance();
+            self.parse_cte_list()?
+        } else {
+            vec![]
+        };
+
+        let mut stmt = self.parse_select_core()?;
+        stmt.ctes = ctes;
+
+        // Parse compound operators: UNION [ALL] / INTERSECT / EXCEPT
+        while matches!(
+            self.current(),
+            Token::Union | Token::Intersect | Token::Except
+        ) {
+            let op = match self.advance().clone() {
+                Token::Union => {
+                    if self.current() == &Token::All {
+                        self.advance();
+                        CompoundType::UnionAll
+                    } else {
+                        CompoundType::Union
+                    }
+                }
+                Token::Intersect => CompoundType::Intersect,
+                Token::Except => CompoundType::Except,
+                _ => unreachable!(),
+            };
+            let body = self.parse_select_body()?;
+            stmt.compound.push(CompoundOp { op, select: body });
+        }
+
+        // ORDER BY / LIMIT / OFFSET after compounds apply to the whole result
+        if !stmt.compound.is_empty() {
+            if self.current() == &Token::Order {
+                self.advance();
+                self.expect(&Token::By)?;
+                stmt.order_by = self.parse_order_by_list()?;
+            }
+            if self.current() == &Token::Limit {
+                self.advance();
+                stmt.limit = Some(self.parse_expr()?);
+            }
+            if self.current() == &Token::Offset {
+                self.advance();
+                stmt.offset = Some(self.parse_expr()?);
+            }
+        }
+
+        Ok(stmt)
+    }
+
+    fn parse_cte_list(&mut self) -> Result<Vec<Cte>> {
+        let recursive = if self.current() == &Token::Recursive {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let mut ctes = vec![self.parse_cte(recursive)?];
+        while self.current() == &Token::Comma {
+            self.advance();
+            ctes.push(self.parse_cte(recursive)?);
+        }
+        Ok(ctes)
+    }
+
+    fn parse_cte(&mut self, recursive: bool) -> Result<Cte> {
+        let name = self.expect_identifier()?;
+        let columns = if self.current() == &Token::LeftParen {
+            self.advance();
+            let mut cols = vec![self.expect_identifier()?];
+            while self.current() == &Token::Comma {
+                self.advance();
+                cols.push(self.expect_identifier()?);
+            }
+            self.expect(&Token::RightParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+        self.expect(&Token::As)?;
+        self.expect(&Token::LeftParen)?;
+        let query = self.parse_select_full()?;
+        self.expect(&Token::RightParen)?;
+        Ok(Cte {
+            name,
+            columns,
+            query,
+            recursive,
+        })
+    }
+
+    /// Parse the core SELECT body (without CTEs or compound trailing).
+    fn parse_select_core(&mut self) -> Result<SelectStatement> {
         self.expect(&Token::Select)?;
 
         let distinct = if self.current() == &Token::Distinct {
@@ -257,6 +360,7 @@ impl Parser {
         };
 
         Ok(SelectStatement {
+            ctes: vec![],
             distinct,
             columns,
             from,
@@ -266,6 +370,59 @@ impl Parser {
             order_by,
             limit,
             offset,
+            compound: vec![],
+        })
+    }
+
+    /// Parse a SELECT body for compound operators (no CTEs, no trailing ORDER/LIMIT).
+    fn parse_select_body(&mut self) -> Result<SelectBody> {
+        self.expect(&Token::Select)?;
+
+        let distinct = if self.current() == &Token::Distinct {
+            self.advance();
+            true
+        } else {
+            false
+        };
+
+        let columns = self.parse_select_columns()?;
+
+        let from = if self.current() == &Token::From {
+            self.advance();
+            Some(self.parse_from_clause()?)
+        } else {
+            None
+        };
+
+        let where_clause = if self.current() == &Token::Where {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        let group_by = if self.current() == &Token::Group {
+            self.advance();
+            self.expect(&Token::By)?;
+            self.parse_expr_list()?
+        } else {
+            vec![]
+        };
+
+        let having = if self.current() == &Token::Having {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        Ok(SelectBody {
+            distinct,
+            columns,
+            from,
+            where_clause,
+            group_by,
+            having,
         })
     }
 
@@ -391,7 +548,7 @@ impl Parser {
             // Could be a subquery or a parenthesised from clause.
             if self.peek_ahead(1) == &Token::Select {
                 self.advance(); // consume (
-                let query = self.parse_select()?;
+                let query = self.parse_select_full()?;
                 self.expect(&Token::RightParen)?;
                 // Alias is required for subqueries.
                 if self.current() == &Token::As {
@@ -557,8 +714,10 @@ impl Parser {
         match self.current() {
             Token::Table => self.parse_create_table(),
             Token::Index => self.parse_create_index(false),
+            Token::View => self.parse_create_view(),
+            Token::Trigger => self.parse_create_trigger(),
             _ => Err(self.error(format!(
-                "expected TABLE or INDEX after CREATE, got {:?}",
+                "expected TABLE, INDEX, VIEW, or TRIGGER after CREATE, got {:?}",
                 self.current()
             ))),
         }
@@ -847,8 +1006,142 @@ impl Parser {
         }))
     }
 
+    fn parse_create_view(&mut self) -> Result<Statement> {
+        self.expect(&Token::View)?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.expect_identifier()?;
+
+        // Optional column list
+        let columns = if self.current() == &Token::LeftParen {
+            self.advance();
+            let mut cols = vec![self.expect_identifier()?];
+            while self.current() == &Token::Comma {
+                self.advance();
+                cols.push(self.expect_identifier()?);
+            }
+            self.expect(&Token::RightParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+
+        self.expect(&Token::As)?;
+        let query = self.parse_select_full()?;
+
+        Ok(Statement::CreateView(CreateViewStatement {
+            name,
+            columns,
+            query,
+            if_not_exists,
+        }))
+    }
+
+    fn parse_create_trigger(&mut self) -> Result<Statement> {
+        self.expect(&Token::Trigger)?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.expect_identifier()?;
+
+        // Timing: BEFORE | AFTER | INSTEAD OF
+        let timing = match self.current() {
+            Token::Before => {
+                self.advance();
+                TriggerTiming::Before
+            }
+            Token::After => {
+                self.advance();
+                TriggerTiming::After
+            }
+            Token::Instead => {
+                self.advance();
+                self.expect(&Token::Of)?;
+                TriggerTiming::InsteadOf
+            }
+            _ => TriggerTiming::Before, // default
+        };
+
+        // Event: INSERT | UPDATE [OF col, ...] | DELETE
+        let event = match self.current() {
+            Token::Insert => {
+                self.advance();
+                TriggerEvent::Insert
+            }
+            Token::Update => {
+                self.advance();
+                if self.current() == &Token::Of {
+                    self.advance();
+                    let mut cols = vec![self.expect_identifier()?];
+                    while self.current() == &Token::Comma {
+                        self.advance();
+                        cols.push(self.expect_identifier()?);
+                    }
+                    TriggerEvent::Update(Some(cols))
+                } else {
+                    TriggerEvent::Update(None)
+                }
+            }
+            Token::Delete => {
+                self.advance();
+                TriggerEvent::Delete
+            }
+            _ => {
+                return Err(self.error(format!(
+                    "expected INSERT, UPDATE, or DELETE in trigger, got {:?}",
+                    self.current()
+                )))
+            }
+        };
+
+        self.expect(&Token::On)?;
+        let table = self.expect_identifier()?;
+
+        // Optional FOR EACH ROW
+        let for_each_row = if self.current() == &Token::For {
+            self.advance();
+            // expect "each" as identifier
+            let each = self.expect_identifier()?;
+            if each.to_uppercase() != "EACH" {
+                return Err(self.error(format!("expected EACH, got {each}")));
+            }
+            self.expect(&Token::Row)?;
+            true
+        } else {
+            false
+        };
+
+        // Optional WHEN condition
+        let when = if self.current() == &Token::When {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
+        // BEGIN ... END
+        self.expect(&Token::Begin)?;
+        let mut body = Vec::new();
+        while self.current() != &Token::End && self.current() != &Token::Eof {
+            body.push(self.parse_statement()?);
+            // Consume optional semicolons between statements
+            while self.current() == &Token::Semicolon {
+                self.advance();
+            }
+        }
+        self.expect(&Token::End)?;
+
+        Ok(Statement::CreateTrigger(CreateTriggerStatement {
+            name,
+            timing,
+            event,
+            table,
+            for_each_row,
+            when,
+            body,
+            if_not_exists,
+        }))
+    }
+
     // =======================================================================
-    // DROP TABLE / INDEX
+    // DROP TABLE / INDEX / VIEW / TRIGGER
     // =======================================================================
 
     fn parse_drop(&mut self) -> Result<Statement> {
@@ -866,8 +1159,20 @@ impl Parser {
                 let name = self.expect_identifier()?;
                 Ok(Statement::DropIndex(DropIndexStatement { name, if_exists }))
             }
+            Token::View => {
+                self.advance();
+                let if_exists = self.parse_if_exists()?;
+                let name = self.expect_identifier()?;
+                Ok(Statement::DropView(DropViewStatement { name, if_exists }))
+            }
+            Token::Trigger => {
+                self.advance();
+                let if_exists = self.parse_if_exists()?;
+                let name = self.expect_identifier()?;
+                Ok(Statement::DropTrigger(DropTriggerStatement { name, if_exists }))
+            }
             _ => Err(self.error(format!(
-                "expected TABLE or INDEX after DROP, got {:?}",
+                "expected TABLE, INDEX, VIEW, or TRIGGER after DROP, got {:?}",
                 self.current()
             ))),
         }
@@ -999,7 +1304,7 @@ impl Parser {
                     self.expect(&Token::LeftParen)?;
                     // Check for subquery
                     if self.current() == &Token::Select {
-                        let query = self.parse_select()?;
+                        let query = self.parse_select_full()?;
                         self.expect(&Token::RightParen)?;
                         left = Expr::InList {
                             expr: Box::new(left),
@@ -1325,7 +1630,7 @@ impl Parser {
             Token::LeftParen => {
                 self.advance();
                 if self.current() == &Token::Select {
-                    let query = self.parse_select()?;
+                    let query = self.parse_select_full()?;
                     self.expect(&Token::RightParen)?;
                     Ok(Expr::Subquery(Box::new(query)))
                 } else {
@@ -1380,7 +1685,7 @@ impl Parser {
             Token::Exists => {
                 self.advance();
                 self.expect(&Token::LeftParen)?;
-                let query = self.parse_select()?;
+                let query = self.parse_select_full()?;
                 self.expect(&Token::RightParen)?;
                 Ok(Expr::Exists(Box::new(query)))
             }
@@ -1426,6 +1731,25 @@ impl Parser {
                 }
                 // Simple column reference
                 Ok(Expr::Column { table: None, name })
+            }
+            // Keywords that can also be function names in expression context
+            Token::Replace => {
+                self.advance();
+                if self.current() == &Token::LeftParen {
+                    self.advance();
+                    let args = if self.current() == &Token::RightParen {
+                        vec![]
+                    } else {
+                        self.parse_expr_list()?
+                    };
+                    self.expect(&Token::RightParen)?;
+                    return Ok(Expr::Function {
+                        name: "REPLACE".to_string(),
+                        args,
+                        distinct: false,
+                    });
+                }
+                Err(self.error("unexpected REPLACE in expression context".to_string()))
             }
             // Star — when used in expression context (e.g. COUNT(*) is handled
             // above, but if somehow we land here, treat it as a column ref).
@@ -2364,6 +2688,215 @@ mod tests {
             assert!(p.value.is_some());
         } else {
             panic!("expected Pragma");
+        }
+    }
+
+    // =======================================================================
+    // CTE tests
+    // =======================================================================
+
+    #[test]
+    fn parse_simple_cte() {
+        let stmt = parse_one("WITH cte AS (SELECT 1) SELECT * FROM cte");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.ctes.len(), 1);
+            assert_eq!(s.ctes[0].name, "cte");
+            assert!(!s.ctes[0].recursive);
+            assert!(s.ctes[0].columns.is_none());
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn parse_cte_with_columns() {
+        let stmt = parse_one("WITH cte(a, b) AS (SELECT 1, 2) SELECT a, b FROM cte");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.ctes.len(), 1);
+            assert_eq!(s.ctes[0].columns, Some(vec!["a".into(), "b".into()]));
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn parse_recursive_cte() {
+        let stmt = parse_one(
+            "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 10) \
+             SELECT x FROM cnt"
+        );
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.ctes.len(), 1);
+            assert!(s.ctes[0].recursive);
+            assert_eq!(s.ctes[0].name, "cnt");
+            // The inner query should have a UNION ALL compound
+            assert_eq!(s.ctes[0].query.compound.len(), 1);
+            assert_eq!(s.ctes[0].query.compound[0].op, CompoundType::UnionAll);
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn parse_multiple_ctes() {
+        let stmt = parse_one(
+            "WITH a AS (SELECT 1), b AS (SELECT 2) SELECT * FROM a, b"
+        );
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.ctes.len(), 2);
+            assert_eq!(s.ctes[0].name, "a");
+            assert_eq!(s.ctes[1].name, "b");
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    // =======================================================================
+    // UNION / INTERSECT / EXCEPT tests
+    // =======================================================================
+
+    #[test]
+    fn parse_union() {
+        let stmt = parse_one("SELECT 1 UNION SELECT 2");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.compound.len(), 1);
+            assert_eq!(s.compound[0].op, CompoundType::Union);
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn parse_union_all() {
+        let stmt = parse_one("SELECT 1 UNION ALL SELECT 2");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.compound.len(), 1);
+            assert_eq!(s.compound[0].op, CompoundType::UnionAll);
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn parse_intersect() {
+        let stmt = parse_one("SELECT 1 INTERSECT SELECT 1");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.compound.len(), 1);
+            assert_eq!(s.compound[0].op, CompoundType::Intersect);
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn parse_except() {
+        let stmt = parse_one("SELECT 1, 2 EXCEPT SELECT 1, 2");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.compound.len(), 1);
+            assert_eq!(s.compound[0].op, CompoundType::Except);
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    #[test]
+    fn parse_union_chain() {
+        let stmt = parse_one("SELECT 1 UNION SELECT 2 UNION ALL SELECT 3");
+        if let Statement::Select(s) = stmt {
+            assert_eq!(s.compound.len(), 2);
+            assert_eq!(s.compound[0].op, CompoundType::Union);
+            assert_eq!(s.compound[1].op, CompoundType::UnionAll);
+        } else {
+            panic!("expected Select");
+        }
+    }
+
+    // =======================================================================
+    // CREATE VIEW / DROP VIEW tests
+    // =======================================================================
+
+    #[test]
+    fn parse_create_view() {
+        let stmt = parse_one("CREATE VIEW v AS SELECT * FROM t");
+        if let Statement::CreateView(cv) = stmt {
+            assert_eq!(cv.name, "v");
+            assert!(cv.columns.is_none());
+            assert!(!cv.if_not_exists);
+        } else {
+            panic!("expected CreateView");
+        }
+    }
+
+    #[test]
+    fn parse_create_view_if_not_exists_with_columns() {
+        let stmt = parse_one("CREATE VIEW IF NOT EXISTS v(a, b) AS SELECT 1, 2");
+        if let Statement::CreateView(cv) = stmt {
+            assert_eq!(cv.name, "v");
+            assert!(cv.if_not_exists);
+            assert_eq!(cv.columns, Some(vec!["a".into(), "b".into()]));
+        } else {
+            panic!("expected CreateView");
+        }
+    }
+
+    #[test]
+    fn parse_drop_view() {
+        let stmt = parse_one("DROP VIEW IF EXISTS v");
+        if let Statement::DropView(dv) = stmt {
+            assert_eq!(dv.name, "v");
+            assert!(dv.if_exists);
+        } else {
+            panic!("expected DropView");
+        }
+    }
+
+    // =======================================================================
+    // CREATE TRIGGER / DROP TRIGGER tests
+    // =======================================================================
+
+    #[test]
+    fn parse_create_trigger_before_insert() {
+        let stmt = parse_one(
+            "CREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT INTO log VALUES (1); END"
+        );
+        if let Statement::CreateTrigger(ct) = stmt {
+            assert_eq!(ct.name, "trg");
+            assert_eq!(ct.timing, TriggerTiming::Before);
+            assert!(matches!(ct.event, TriggerEvent::Insert));
+            assert_eq!(ct.table, "t");
+            assert!(ct.for_each_row);
+            assert!(ct.when.is_none());
+            assert_eq!(ct.body.len(), 1);
+        } else {
+            panic!("expected CreateTrigger");
+        }
+    }
+
+    #[test]
+    fn parse_create_trigger_after_update_of_columns() {
+        let stmt = parse_one(
+            "CREATE TRIGGER trg AFTER UPDATE OF a, b ON t BEGIN DELETE FROM log; END"
+        );
+        if let Statement::CreateTrigger(ct) = stmt {
+            assert_eq!(ct.timing, TriggerTiming::After);
+            if let TriggerEvent::Update(Some(cols)) = &ct.event {
+                assert_eq!(cols, &["a".to_string(), "b".to_string()]);
+            } else {
+                panic!("expected Update with columns");
+            }
+        } else {
+            panic!("expected CreateTrigger");
+        }
+    }
+
+    #[test]
+    fn parse_drop_trigger() {
+        let stmt = parse_one("DROP TRIGGER IF EXISTS trg");
+        if let Statement::DropTrigger(dt) = stmt {
+            assert_eq!(dt.name, "trg");
+            assert!(dt.if_exists);
+        } else {
+            panic!("expected DropTrigger");
         }
     }
 }

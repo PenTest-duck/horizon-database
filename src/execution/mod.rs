@@ -41,14 +41,26 @@ pub fn execute_statement(
         Statement::Rollback => {
             execute_rollback(pool, catalog, txn_mgr)
         }
-        Statement::AlterTable(_) => {
-            Err(HorizonError::NotImplemented("ALTER TABLE".into()))
-        }
+        Statement::AlterTable(alter) => execute_alter_table(alter, pool, catalog),
         Statement::Explain(_) => {
-            Err(HorizonError::NotImplemented("EXPLAIN".into()))
+            // EXPLAIN returns rows; handled in Database::query()
+            Err(HorizonError::Internal("use query() for EXPLAIN statements".into()))
         }
         Statement::Pragma(_) => {
-            Err(HorizonError::NotImplemented("PRAGMA".into()))
+            // PRAGMA returns rows; handled in Database::query()
+            Err(HorizonError::Internal("use query() for PRAGMA statements".into()))
+        }
+        Statement::CreateView(_) => {
+            Err(HorizonError::NotImplemented("CREATE VIEW".into()))
+        }
+        Statement::DropView(_) => {
+            Err(HorizonError::NotImplemented("DROP VIEW".into()))
+        }
+        Statement::CreateTrigger(_) => {
+            Err(HorizonError::NotImplemented("CREATE TRIGGER".into()))
+        }
+        Statement::DropTrigger(_) => {
+            Err(HorizonError::NotImplemented("DROP TRIGGER".into()))
         }
         Statement::Select(_) => {
             Err(HorizonError::Internal("use execute_query for SELECT statements".into()))
@@ -65,7 +77,9 @@ pub fn execute_query(
 ) -> Result<QueryResult> {
     match stmt {
         Statement::Select(select) => execute_select(select, pool, catalog),
-        _ => Err(HorizonError::Internal("execute_query requires a SELECT statement".into())),
+        Statement::Pragma(pragma) => execute_pragma(pragma, pool, catalog),
+        Statement::Explain(inner) => execute_explain(inner, catalog),
+        _ => Err(HorizonError::Internal("execute_query requires a SELECT, PRAGMA, or EXPLAIN statement".into())),
     }
 }
 
@@ -379,16 +393,17 @@ fn execute_select(
         let row_values = deserialize_row(&entry.value, table.columns.len())?;
 
         // Evaluate WHERE clause (still needed even with index scan for correctness,
-        // e.g. when index scan returns a superset for range queries)
+        // e.g. when index scan returns a superset for range queries).
+        // Use eval_expr_with_ctx to support subqueries (EXISTS, scalar subquery) in WHERE.
         if let Some(ref where_clause) = select.where_clause {
-            let result = eval_expr(where_clause, &row_values, &table.columns, &table)?;
+            let result = eval_expr_with_ctx(where_clause, &row_values, &table.columns, &table, pool, catalog)?;
             if !result.to_bool() {
                 continue;
             }
         }
 
-        // Project columns
-        let projected = project_row(&select.columns, &row_values, &table)?;
+        // Project columns using subquery-aware evaluation
+        let projected = project_row_with_ctx(&select.columns, &row_values, &table, pool, catalog)?;
 
         rows.push(Row {
             columns: columns.clone(),
@@ -443,8 +458,13 @@ fn select_has_aggregate(columns: &[SelectColumn]) -> bool {
 /// Recursively check if an expression contains an aggregate function.
 fn expr_has_aggregate_fn(expr: &Expr) -> bool {
     match expr {
-        Expr::Function { name, .. } => {
+        Expr::Function { name, args, .. } => {
             let upper = name.to_uppercase();
+            // MIN and MAX with 2+ args are scalar functions, not aggregates
+            if (upper == "MIN" || upper == "MAX") && args.len() >= 2 {
+                // Check if any arguments contain aggregate functions
+                return args.iter().any(|a| expr_has_aggregate_fn(a));
+            }
             matches!(
                 upper.as_str(),
                 "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT" | "TOTAL"
@@ -1053,6 +1073,30 @@ fn eval_function_dynamic(
                 Ok(Value::Null)
             }
         }
+        "MAX" if args.len() >= 2 => {
+            // Scalar MAX: returns the maximum of its arguments
+            let mut max_val = eval_expr_dynamic(&args[0], row, col_names)?;
+            for arg in &args[1..] {
+                let v = eval_expr_dynamic(arg, row, col_names)?;
+                if v.is_null() { continue; }
+                if max_val.is_null() || v > max_val {
+                    max_val = v;
+                }
+            }
+            Ok(max_val)
+        }
+        "MIN" if args.len() >= 2 => {
+            // Scalar MIN: returns the minimum of its arguments
+            let mut min_val = eval_expr_dynamic(&args[0], row, col_names)?;
+            for arg in &args[1..] {
+                let v = eval_expr_dynamic(arg, row, col_names)?;
+                if v.is_null() { continue; }
+                if min_val.is_null() || v < min_val {
+                    min_val = v;
+                }
+            }
+            Ok(min_val)
+        }
         // Aggregate functions in per-row context just evaluate the argument
         "MAX" | "MIN" | "COUNT" | "SUM" | "AVG" | "TOTAL" | "GROUP_CONCAT" => {
             let is_star = args.len() == 1 && matches!(&args[0], Expr::Column { table: None, name } if name == "*");
@@ -1119,6 +1163,100 @@ fn eval_function_dynamic(
                     Ok(Value::Integer(s.find(&needle).map(|i| i as i64 + 1).unwrap_or(0)))
                 }
                 _ => Ok(Value::Integer(0)),
+            }
+        }
+        "LTRIM" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr_dynamic(&args[0], row, col_names)?;
+            match val {
+                Value::Text(s) => Ok(Value::Text(s.trim_start().to_string())),
+                _ => Ok(val),
+            }
+        }
+        "RTRIM" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr_dynamic(&args[0], row, col_names)?;
+            match val {
+                Value::Text(s) => Ok(Value::Text(s.trim_end().to_string())),
+                _ => Ok(val),
+            }
+        }
+        "HEX" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr_dynamic(&args[0], row, col_names)?;
+            match val {
+                Value::Blob(b) => {
+                    let hex: String = b.iter().map(|byte| format!("{:02X}", byte)).collect();
+                    Ok(Value::Text(hex))
+                }
+                Value::Text(s) => {
+                    let hex: String = s.as_bytes().iter().map(|byte| format!("{:02X}", byte)).collect();
+                    Ok(Value::Text(hex))
+                }
+                Value::Integer(i) => {
+                    let hex: String = i.to_string().as_bytes().iter().map(|byte| format!("{:02X}", byte)).collect();
+                    Ok(Value::Text(hex))
+                }
+                Value::Null => Ok(Value::Null),
+                Value::Real(r) => {
+                    let hex: String = r.to_string().as_bytes().iter().map(|byte| format!("{:02X}", byte)).collect();
+                    Ok(Value::Text(hex))
+                }
+            }
+        }
+        "ROUND" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr_dynamic(&args[0], row, col_names)?;
+            let decimals = if args.len() > 1 {
+                eval_expr_dynamic(&args[1], row, col_names)?.as_integer().unwrap_or(0)
+            } else {
+                0
+            };
+            match val {
+                Value::Real(r) => {
+                    let factor = 10f64.powi(decimals as i32);
+                    Ok(Value::Real((r * factor).round() / factor))
+                }
+                Value::Integer(i) => {
+                    if decimals >= 0 {
+                        Ok(Value::Real(i as f64))
+                    } else {
+                        let factor = 10f64.powi((-decimals) as i32);
+                        Ok(Value::Real(((i as f64 / factor).round()) * factor))
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "RANDOM" => {
+            // Simple pseudo-random integer using system time
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            // Mix bits for a reasonable pseudo-random value
+            let val = (now.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) as i64;
+            Ok(Value::Integer(val))
+        }
+        "ZEROBLOB" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr_dynamic(&args[0], row, col_names)?;
+            match val {
+                Value::Integer(n) => {
+                    let size = n.max(0) as usize;
+                    Ok(Value::Blob(vec![0u8; size]))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "IIF" => {
+            if args.len() < 3 { return Ok(Value::Null); }
+            let cond = eval_expr_dynamic(&args[0], row, col_names)?;
+            if cond.to_bool() {
+                eval_expr_dynamic(&args[1], row, col_names)
+            } else {
+                eval_expr_dynamic(&args[2], row, col_names)
             }
         }
         _ => Err(HorizonError::NotImplemented(format!("function: {}", name))),
@@ -1267,6 +1405,36 @@ fn eval_aggregate_expr(
             let val = eval_aggregate_expr(inner, representative, col_names, group)?;
             let affinity = determine_affinity(type_name);
             Ok(val.apply_affinity(affinity))
+        }
+
+        Expr::Case { operand, when_clauses, else_clause } => {
+            if let Some(ref operand_expr) = operand {
+                let op_val = eval_aggregate_expr(operand_expr, representative, col_names, group)?;
+                for (when_expr, then_expr) in when_clauses {
+                    let when_val = eval_aggregate_expr(when_expr, representative, col_names, group)?;
+                    if op_val == when_val {
+                        return eval_aggregate_expr(then_expr, representative, col_names, group);
+                    }
+                }
+            } else {
+                for (when_expr, then_expr) in when_clauses {
+                    let when_val = eval_aggregate_expr(when_expr, representative, col_names, group)?;
+                    if when_val.to_bool() {
+                        return eval_aggregate_expr(then_expr, representative, col_names, group);
+                    }
+                }
+            }
+            if let Some(ref else_expr) = else_clause {
+                eval_aggregate_expr(else_expr, representative, col_names, group)
+            } else {
+                Ok(Value::Null)
+            }
+        }
+
+        Expr::IsNull { expr: inner, negated } => {
+            let val = eval_aggregate_expr(inner, representative, col_names, group)?;
+            let is_null = val.is_null();
+            Ok(Value::Integer(if is_null != *negated { 1 } else { 0 }))
         }
 
         // Non-aggregate leaf expressions: evaluate on representative row
@@ -1723,6 +1891,152 @@ fn execute_drop_index(
     Ok(0)
 }
 
+// ---- ALTER TABLE ----
+
+fn execute_alter_table(alter: &AlterTableStatement, pool: &mut BufferPool, catalog: &mut Catalog) -> Result<usize> {
+    match &alter.action {
+        AlterTableAction::AddColumn(col_def) => {
+            let type_name = col_def.type_name.clone().unwrap_or_default();
+            let affinity = determine_affinity(&type_name);
+            let table = catalog.get_table(&alter.table)?;
+            let position = table.columns.len();
+            let col_info = ColumnInfo {
+                name: col_def.name.clone(), type_name, affinity,
+                primary_key: false, autoincrement: false,
+                not_null: col_def.not_null, unique: col_def.unique,
+                default_value: col_def.default.as_ref().map(|e| eval_const_expr(e)),
+                position,
+            };
+            catalog.add_column(pool, &alter.table, col_info)?;
+            Ok(0)
+        }
+        AlterTableAction::RenameTable(new_name) => { catalog.rename_table(pool, &alter.table, new_name)?; Ok(0) }
+        AlterTableAction::RenameColumn { old_name, new_name } => { catalog.rename_column(pool, &alter.table, old_name, new_name)?; Ok(0) }
+        AlterTableAction::DropColumn(col_name) => { catalog.drop_column(pool, &alter.table, col_name)?; Ok(0) }
+    }
+}
+
+// ---- PRAGMA ----
+
+fn execute_pragma(pragma: &PragmaStatement, pool: &mut BufferPool, catalog: &mut Catalog) -> Result<QueryResult> {
+    let pragma_name = pragma.name.to_lowercase();
+    match pragma_name.as_str() {
+        "table_info" => {
+            let table_name = pragma_extract_table_name(pragma)?;
+            let table = catalog.get_table(&table_name)?;
+            let columns = Arc::new(vec!["cid".into(), "name".into(), "type".into(), "notnull".into(), "dflt_value".into(), "pk".into()]);
+            let mut rows = Vec::new();
+            for (i, col) in table.columns.iter().enumerate() {
+                let dflt = col.default_value.clone().unwrap_or(Value::Null);
+                rows.push(Row { columns: columns.clone(), values: vec![
+                    Value::Integer(i as i64), Value::Text(col.name.clone()), Value::Text(col.type_name.clone()),
+                    Value::Integer(if col.not_null { 1 } else { 0 }), dflt, Value::Integer(if col.primary_key { 1 } else { 0 }),
+                ]});
+            }
+            Ok(QueryResult { columns, rows })
+        }
+        "index_list" => {
+            let table_name = pragma_extract_table_name(pragma)?;
+            let _ = catalog.get_table(&table_name)?;
+            let indexes = catalog.get_indexes_for_table(&table_name);
+            let columns = Arc::new(vec!["seq".into(), "name".into(), "unique".into(), "origin".into(), "partial".into()]);
+            let mut rows = Vec::new();
+            for (i, idx) in indexes.iter().enumerate() {
+                rows.push(Row { columns: columns.clone(), values: vec![
+                    Value::Integer(i as i64), Value::Text(idx.name.clone()),
+                    Value::Integer(if idx.unique { 1 } else { 0 }), Value::Text("c".into()), Value::Integer(0),
+                ]});
+            }
+            Ok(QueryResult { columns, rows })
+        }
+        "database_list" => {
+            let columns = Arc::new(vec!["seq".into(), "name".into(), "file".into()]);
+            let rows = vec![Row { columns: columns.clone(), values: vec![Value::Integer(0), Value::Text("main".into()), Value::Text(String::new())] }];
+            Ok(QueryResult { columns, rows })
+        }
+        "page_size" => {
+            let columns = Arc::new(vec!["page_size".into()]);
+            Ok(QueryResult { columns: columns.clone(), rows: vec![Row { columns, values: vec![Value::Integer(4096)] }] })
+        }
+        "page_count" => {
+            let count = pool.pager().page_count();
+            let columns = Arc::new(vec!["page_count".into()]);
+            Ok(QueryResult { columns: columns.clone(), rows: vec![Row { columns, values: vec![Value::Integer(count as i64)] }] })
+        }
+        _ => {
+            let columns = Arc::new(vec![pragma.name.clone()]);
+            Ok(QueryResult { columns, rows: vec![] })
+        }
+    }
+}
+
+fn pragma_extract_table_name(pragma: &PragmaStatement) -> Result<String> {
+    match &pragma.value {
+        Some(Expr::Column { name, .. }) => Ok(name.clone()),
+        Some(Expr::Literal(LiteralValue::String(s))) => Ok(s.clone()),
+        _ => Err(HorizonError::InvalidSql("PRAGMA requires a table name argument".into())),
+    }
+}
+
+// ---- EXPLAIN ----
+
+fn execute_explain(inner_stmt: &Statement, catalog: &Catalog) -> Result<QueryResult> {
+    let plan = plan_statement(inner_stmt, catalog)?;
+    let detail = format_plan(&plan, 0);
+    let columns = Arc::new(vec!["detail".to_string()]);
+    let rows = detail.lines().map(|line| Row { columns: columns.clone(), values: vec![Value::Text(line.to_string())] }).collect();
+    Ok(QueryResult { columns, rows })
+}
+
+fn format_plan(plan: &LogicalPlan, indent: usize) -> String {
+    let pfx = "  ".repeat(indent);
+    match plan {
+        LogicalPlan::SeqScan { table, alias } => {
+            let a = alias.as_deref().map(|a| format!(" AS {}", a)).unwrap_or_default();
+            format!("{}SCAN TABLE {}{}", pfx, table, a)
+        }
+        LogicalPlan::Filter { input, predicate } => format!("{}FILTER {:?}\n{}", pfx, predicate, format_plan(input, indent + 1)),
+        LogicalPlan::Project { input, columns } => {
+            let cs: Vec<String> = columns.iter().map(|c| match c {
+                SelectColumn::AllColumns => "*".into(),
+                SelectColumn::TableAllColumns(t) => format!("{}.*", t),
+                SelectColumn::Expr { expr, alias } => { let b = format!("{:?}", expr); alias.as_ref().map(|a| format!("{} AS {}", b, a)).unwrap_or(b) }
+            }).collect();
+            format!("{}PROJECT {}\n{}", pfx, cs.join(", "), format_plan(input, indent + 1))
+        }
+        LogicalPlan::Sort { input, order_by } => {
+            let ps: Vec<String> = order_by.iter().map(|o| format!("{:?} {}", o.expr, if o.desc { "DESC" } else { "ASC" })).collect();
+            format!("{}SORT {}\n{}", pfx, ps.join(", "), format_plan(input, indent + 1))
+        }
+        LogicalPlan::Limit { input, limit, offset } => {
+            let o = offset.as_ref().map(|e| format!(" OFFSET {:?}", e)).unwrap_or_default();
+            format!("{}LIMIT {:?}{}\n{}", pfx, limit, o, format_plan(input, indent + 1))
+        }
+        LogicalPlan::Aggregate { input, group_by, having } => {
+            let g = if group_by.is_empty() { String::new() } else { format!(" GROUP BY {:?}", group_by) };
+            let h = having.as_ref().map(|e| format!(" HAVING {:?}", e)).unwrap_or_default();
+            format!("{}AGGREGATE{}{}\n{}", pfx, g, h, format_plan(input, indent + 1))
+        }
+        LogicalPlan::Join { left, right, join_type, on } => {
+            let jt = match join_type { JoinType::Inner => "INNER JOIN", JoinType::Left => "LEFT JOIN", JoinType::Right => "RIGHT JOIN", JoinType::Cross => "CROSS JOIN" };
+            let o = on.as_ref().map(|e| format!(" ON {:?}", e)).unwrap_or_default();
+            format!("{}{}{}\n{}\n{}", pfx, jt, o, format_plan(left, indent + 1), format_plan(right, indent + 1))
+        }
+        LogicalPlan::Distinct { input } => format!("{}DISTINCT\n{}", pfx, format_plan(input, indent + 1)),
+        LogicalPlan::Insert { table, .. } => format!("{}INSERT INTO {}", pfx, table),
+        LogicalPlan::Update { table, .. } => format!("{}UPDATE {}", pfx, table),
+        LogicalPlan::Delete { table, .. } => format!("{}DELETE FROM {}", pfx, table),
+        LogicalPlan::CreateTable(ct) => format!("{}CREATE TABLE {}", pfx, ct.name),
+        LogicalPlan::DropTable(dt) => format!("{}DROP TABLE {}", pfx, dt.name),
+        LogicalPlan::CreateIndex(ci) => format!("{}CREATE INDEX {} ON {}", pfx, ci.name, ci.table),
+        LogicalPlan::DropIndex(di) => format!("{}DROP INDEX {}", pfx, di.name),
+        LogicalPlan::Begin => format!("{}BEGIN", pfx),
+        LogicalPlan::Commit => format!("{}COMMIT", pfx),
+        LogicalPlan::Rollback => format!("{}ROLLBACK", pfx),
+        LogicalPlan::Empty => format!("{}EMPTY", pfx),
+    }
+}
+
 // ---- ROLLBACK ----
 
 /// Execute a ROLLBACK by replaying the undo log in reverse order.
@@ -1792,24 +2106,30 @@ pub fn serialize_row(values: &[Value]) -> Vec<u8> {
 }
 
 /// Deserialize a row of values from bytes.
+///
+/// Handles schema evolution from ALTER TABLE:
+/// - If the row has fewer columns than expected (ADD COLUMN), missing values are NULL-padded.
+/// - If the row has more columns than expected (DROP COLUMN), extra values are truncated.
 pub fn deserialize_row(data: &[u8], expected_cols: usize) -> Result<Vec<Value>> {
     if data.len() < 2 {
         return Err(HorizonError::CorruptDatabase("row data too short".into()));
     }
     let col_count = u16::from_be_bytes(data[0..2].try_into().unwrap()) as usize;
-    if col_count != expected_cols {
-        return Err(HorizonError::CorruptDatabase(format!(
-            "expected {} columns but row has {}",
-            expected_cols, col_count
-        )));
-    }
 
     let mut offset = 2;
-    let mut values = Vec::with_capacity(col_count);
+    let mut values = Vec::with_capacity(expected_cols);
     for _ in 0..col_count {
         let (val, consumed) = Value::deserialize(&data[offset..])?;
         values.push(val);
         offset += consumed;
+    }
+
+    // Truncate extra columns from rows written before DROP COLUMN
+    values.truncate(expected_cols);
+
+    // NULL-pad any columns added after this row was written (lazy ALTER TABLE ADD COLUMN)
+    while values.len() < expected_cols {
+        values.push(Value::Null);
     }
 
     Ok(values)
@@ -1904,13 +2224,83 @@ fn eval_const_expr(expr: &Expr) -> Value {
                 other => other,
             }
         }
+        Expr::UnaryOp { op: UnaryOp::Not, expr } => {
+            let val = eval_const_expr(expr);
+            if val.is_null() { Value::Null } else {
+                Value::Integer(if val.to_bool() { 0 } else { 1 })
+            }
+        }
         Expr::BinaryOp { left, op, right } => {
             let l = eval_const_expr(left);
             let r = eval_const_expr(right);
             eval_binary_op(&l, op, &r)
         }
+        Expr::Cast { expr: inner, type_name } => {
+            let val = eval_const_expr(inner);
+            let affinity = determine_affinity(type_name);
+            val.apply_affinity(affinity)
+        }
+        Expr::Case { operand, when_clauses, else_clause } => {
+            if let Some(ref operand_expr) = operand {
+                let op_val = eval_const_expr(operand_expr);
+                for (when_expr, then_expr) in when_clauses {
+                    let when_val = eval_const_expr(when_expr);
+                    if op_val == when_val {
+                        return eval_const_expr(then_expr);
+                    }
+                }
+            } else {
+                for (when_expr, then_expr) in when_clauses {
+                    let when_val = eval_const_expr(when_expr);
+                    if when_val.to_bool() {
+                        return eval_const_expr(then_expr);
+                    }
+                }
+            }
+            if let Some(ref else_expr) = else_clause {
+                eval_const_expr(else_expr)
+            } else {
+                Value::Null
+            }
+        }
+        Expr::IsNull { expr: inner, negated } => {
+            let val = eval_const_expr(inner);
+            let is_null = val.is_null();
+            Value::Integer(if is_null != *negated { 1 } else { 0 })
+        }
+        Expr::Function { name, args, .. } => {
+            // Evaluate functions in constant context using the dynamic evaluator with empty row
+            let empty_row: Vec<Value> = vec![];
+            let empty_cols: Vec<String> = vec![];
+            eval_function_dynamic(name, args, &empty_row, &empty_cols).unwrap_or(Value::Null)
+        }
         _ => Value::Null,
     }
+}
+
+/// Execute a scalar subquery, returning the single value from the first row/column.
+/// If the subquery returns no rows, returns NULL.
+fn execute_scalar_subquery(
+    select: &SelectStatement,
+    pool: &mut BufferPool,
+    catalog: &mut Catalog,
+) -> Result<Value> {
+    let result = execute_select(select, pool, catalog)?;
+    if result.rows.is_empty() {
+        Ok(Value::Null)
+    } else {
+        Ok(result.rows[0].values.first().cloned().unwrap_or(Value::Null))
+    }
+}
+
+/// Execute an EXISTS subquery, returning 1 (true) if the subquery returns any rows, 0 otherwise.
+fn execute_exists_subquery(
+    select: &SelectStatement,
+    pool: &mut BufferPool,
+    catalog: &mut Catalog,
+) -> Result<Value> {
+    let result = execute_select(select, pool, catalog)?;
+    Ok(Value::Integer(if result.rows.is_empty() { 0 } else { 1 }))
 }
 
 /// Evaluate an expression in the context of a row.
@@ -2011,8 +2401,127 @@ fn eval_expr(
         }
         Expr::Placeholder(_) => Ok(Value::Null),
         Expr::Subquery(_) | Expr::Exists(_) => {
-            Err(HorizonError::NotImplemented("subqueries in expressions".into()))
+            // Subqueries require pool/catalog context; use eval_expr_with_ctx instead
+            Err(HorizonError::NotImplemented("subqueries in expressions (use eval_expr_with_ctx)".into()))
         }
+    }
+}
+
+/// Evaluate an expression with full subquery support (has pool/catalog context).
+fn eval_expr_with_ctx(
+    expr: &Expr,
+    row: &[Value],
+    columns: &[ColumnInfo],
+    table: &TableInfo,
+    pool: &mut BufferPool,
+    catalog: &mut Catalog,
+) -> Result<Value> {
+    match expr {
+        Expr::Subquery(select) => {
+            execute_scalar_subquery(select, pool, catalog)
+        }
+        Expr::Exists(select) => {
+            execute_exists_subquery(select, pool, catalog)
+        }
+        // For all non-subquery expressions, delegate to eval_expr.
+        // But we need to recursively handle subqueries in nested expressions too.
+        Expr::BinaryOp { left, op, right } => {
+            let l = eval_expr_with_ctx(left, row, columns, table, pool, catalog)?;
+            let r = eval_expr_with_ctx(right, row, columns, table, pool, catalog)?;
+            Ok(eval_binary_op(&l, op, &r))
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            let val = eval_expr_with_ctx(inner, row, columns, table, pool, catalog)?;
+            Ok(eval_unary_op(op, &val))
+        }
+        Expr::Case { operand, when_clauses, else_clause } => {
+            if let Some(ref operand_expr) = operand {
+                let op_val = eval_expr_with_ctx(operand_expr, row, columns, table, pool, catalog)?;
+                for (when_expr, then_expr) in when_clauses {
+                    let when_val = eval_expr_with_ctx(when_expr, row, columns, table, pool, catalog)?;
+                    if op_val == when_val {
+                        return eval_expr_with_ctx(then_expr, row, columns, table, pool, catalog);
+                    }
+                }
+            } else {
+                for (when_expr, then_expr) in when_clauses {
+                    let when_val = eval_expr_with_ctx(when_expr, row, columns, table, pool, catalog)?;
+                    if when_val.to_bool() {
+                        return eval_expr_with_ctx(then_expr, row, columns, table, pool, catalog);
+                    }
+                }
+            }
+            if let Some(ref else_expr) = else_clause {
+                eval_expr_with_ctx(else_expr, row, columns, table, pool, catalog)
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        Expr::IsNull { expr: inner, negated } => {
+            let val = eval_expr_with_ctx(inner, row, columns, table, pool, catalog)?;
+            let is_null = val.is_null();
+            Ok(Value::Integer(if is_null != *negated { 1 } else { 0 }))
+        }
+        // For expressions that don't contain subqueries (literals, columns, etc.),
+        // fall through to the regular eval_expr
+        _ => eval_expr(expr, row, columns, table),
+    }
+}
+
+/// Evaluate a dynamic expression with full subquery support (has pool/catalog context).
+#[allow(dead_code)]
+fn eval_expr_dynamic_with_ctx(
+    expr: &Expr,
+    row: &[Value],
+    col_names: &[String],
+    pool: &mut BufferPool,
+    catalog: &mut Catalog,
+) -> Result<Value> {
+    match expr {
+        Expr::Subquery(select) => {
+            execute_scalar_subquery(select, pool, catalog)
+        }
+        Expr::Exists(select) => {
+            execute_exists_subquery(select, pool, catalog)
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let l = eval_expr_dynamic_with_ctx(left, row, col_names, pool, catalog)?;
+            let r = eval_expr_dynamic_with_ctx(right, row, col_names, pool, catalog)?;
+            Ok(eval_binary_op(&l, op, &r))
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            let val = eval_expr_dynamic_with_ctx(inner, row, col_names, pool, catalog)?;
+            Ok(eval_unary_op(op, &val))
+        }
+        Expr::Case { operand, when_clauses, else_clause } => {
+            if let Some(ref operand_expr) = operand {
+                let op_val = eval_expr_dynamic_with_ctx(operand_expr, row, col_names, pool, catalog)?;
+                for (when_expr, then_expr) in when_clauses {
+                    let when_val = eval_expr_dynamic_with_ctx(when_expr, row, col_names, pool, catalog)?;
+                    if op_val == when_val {
+                        return eval_expr_dynamic_with_ctx(then_expr, row, col_names, pool, catalog);
+                    }
+                }
+            } else {
+                for (when_expr, then_expr) in when_clauses {
+                    let when_val = eval_expr_dynamic_with_ctx(when_expr, row, col_names, pool, catalog)?;
+                    if when_val.to_bool() {
+                        return eval_expr_dynamic_with_ctx(then_expr, row, col_names, pool, catalog);
+                    }
+                }
+            }
+            if let Some(ref else_expr) = else_clause {
+                eval_expr_dynamic_with_ctx(else_expr, row, col_names, pool, catalog)
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        Expr::IsNull { expr: inner, negated } => {
+            let val = eval_expr_dynamic_with_ctx(inner, row, col_names, pool, catalog)?;
+            let is_null = val.is_null();
+            Ok(Value::Integer(if is_null != *negated { 1 } else { 0 }))
+        }
+        _ => eval_expr_dynamic(expr, row, col_names),
     }
 }
 
@@ -2235,6 +2744,30 @@ fn eval_function(
                 Ok(Value::Null)
             }
         }
+        "MAX" if args.len() >= 2 => {
+            // Scalar MAX: returns the maximum of its arguments
+            let mut max_val = eval_expr(&args[0], row, columns, table)?;
+            for arg in &args[1..] {
+                let v = eval_expr(arg, row, columns, table)?;
+                if v.is_null() { continue; }
+                if max_val.is_null() || v > max_val {
+                    max_val = v;
+                }
+            }
+            Ok(max_val)
+        }
+        "MIN" if args.len() >= 2 => {
+            // Scalar MIN: returns the minimum of its arguments
+            let mut min_val = eval_expr(&args[0], row, columns, table)?;
+            for arg in &args[1..] {
+                let v = eval_expr(arg, row, columns, table)?;
+                if v.is_null() { continue; }
+                if min_val.is_null() || v < min_val {
+                    min_val = v;
+                }
+            }
+            Ok(min_val)
+        }
         "MAX" | "MIN" | "COUNT" | "SUM" | "AVG" | "TOTAL" | "GROUP_CONCAT" => {
             // These are aggregate functions -- evaluated per-row they just return the value
             // Full aggregate support handled at a higher level
@@ -2305,6 +2838,98 @@ fn eval_function(
                     Ok(Value::Integer(s.find(&needle).map(|i| i as i64 + 1).unwrap_or(0)))
                 }
                 _ => Ok(Value::Integer(0)),
+            }
+        }
+        "LTRIM" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr(&args[0], row, columns, table)?;
+            match val {
+                Value::Text(s) => Ok(Value::Text(s.trim_start().to_string())),
+                _ => Ok(val),
+            }
+        }
+        "RTRIM" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr(&args[0], row, columns, table)?;
+            match val {
+                Value::Text(s) => Ok(Value::Text(s.trim_end().to_string())),
+                _ => Ok(val),
+            }
+        }
+        "HEX" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr(&args[0], row, columns, table)?;
+            match val {
+                Value::Blob(b) => {
+                    let hex: String = b.iter().map(|byte| format!("{:02X}", byte)).collect();
+                    Ok(Value::Text(hex))
+                }
+                Value::Text(s) => {
+                    let hex: String = s.as_bytes().iter().map(|byte| format!("{:02X}", byte)).collect();
+                    Ok(Value::Text(hex))
+                }
+                Value::Integer(i) => {
+                    let hex: String = i.to_string().as_bytes().iter().map(|byte| format!("{:02X}", byte)).collect();
+                    Ok(Value::Text(hex))
+                }
+                Value::Null => Ok(Value::Null),
+                Value::Real(r) => {
+                    let hex: String = r.to_string().as_bytes().iter().map(|byte| format!("{:02X}", byte)).collect();
+                    Ok(Value::Text(hex))
+                }
+            }
+        }
+        "ROUND" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr(&args[0], row, columns, table)?;
+            let decimals = if args.len() > 1 {
+                eval_expr(&args[1], row, columns, table)?.as_integer().unwrap_or(0)
+            } else {
+                0
+            };
+            match val {
+                Value::Real(r) => {
+                    let factor = 10f64.powi(decimals as i32);
+                    Ok(Value::Real((r * factor).round() / factor))
+                }
+                Value::Integer(i) => {
+                    if decimals >= 0 {
+                        Ok(Value::Real(i as f64))
+                    } else {
+                        let factor = 10f64.powi((-decimals) as i32);
+                        Ok(Value::Real(((i as f64 / factor).round()) * factor))
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "RANDOM" => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let val = (now.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) as i64;
+            Ok(Value::Integer(val))
+        }
+        "ZEROBLOB" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr(&args[0], row, columns, table)?;
+            match val {
+                Value::Integer(n) => {
+                    let size = n.max(0) as usize;
+                    Ok(Value::Blob(vec![0u8; size]))
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "IIF" => {
+            if args.len() < 3 { return Ok(Value::Null); }
+            let cond = eval_expr(&args[0], row, columns, table)?;
+            if cond.to_bool() {
+                eval_expr(&args[1], row, columns, table)
+            } else {
+                eval_expr(&args[2], row, columns, table)
             }
         }
         _ => Err(HorizonError::NotImplemented(format!("function: {}", name))),
@@ -2382,6 +3007,7 @@ fn resolve_column_names(
     Ok(names)
 }
 
+#[allow(dead_code)]
 fn project_row(
     select_cols: &[SelectColumn],
     row: &[Value],
@@ -2398,6 +3024,32 @@ fn project_row(
             }
             SelectColumn::Expr { expr, .. } => {
                 let val = eval_expr(expr, row, &table.columns, table)?;
+                values.push(val);
+            }
+        }
+    }
+    Ok(values)
+}
+
+/// Project a row with subquery support (has pool/catalog context).
+fn project_row_with_ctx(
+    select_cols: &[SelectColumn],
+    row: &[Value],
+    table: &TableInfo,
+    pool: &mut BufferPool,
+    catalog: &mut Catalog,
+) -> Result<Vec<Value>> {
+    let mut values = Vec::new();
+    for col in select_cols {
+        match col {
+            SelectColumn::AllColumns => {
+                values.extend(row.iter().cloned());
+            }
+            SelectColumn::TableAllColumns(_) => {
+                values.extend(row.iter().cloned());
+            }
+            SelectColumn::Expr { expr, .. } => {
+                let val = eval_expr_with_ctx(expr, row, &table.columns, table, pool, catalog)?;
                 values.push(val);
             }
         }

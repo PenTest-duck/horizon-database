@@ -146,7 +146,18 @@ impl Database {
         })?;
 
         let DatabaseInner { buffer_pool, catalog, txn_manager } = &mut *inner;
-        execution::execute_query(&stmts[0], buffer_pool, catalog, txn_manager)
+
+        // Route SELECT, PRAGMA, and EXPLAIN through execute_query
+        match &stmts[0] {
+            sql::ast::Statement::Select(_)
+            | sql::ast::Statement::Pragma(_)
+            | sql::ast::Statement::Explain(_) => {
+                execution::execute_query(&stmts[0], buffer_pool, catalog, txn_manager)
+            }
+            _ => Err(HorizonError::Internal(
+                "query() requires a SELECT, PRAGMA, or EXPLAIN statement".into(),
+            )),
+        }
     }
 
     /// Get the file path.
