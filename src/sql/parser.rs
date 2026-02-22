@@ -142,6 +142,8 @@ impl Parser {
             Token::Always => "always",
             Token::Stored => "stored",
             Token::Virtual => "virtual",
+            Token::Using => "using",
+            Token::Match => "match",
             _ => return None,
         };
         Some(name.to_string())
@@ -602,6 +604,27 @@ impl Parser {
         }
 
         let name = self.expect_identifier()?;
+
+        // Check for table-valued function call: table_name('args')
+        if self.current() == &Token::LeftParen {
+            self.advance();
+            let args = if self.current() == &Token::RightParen {
+                vec![]
+            } else {
+                self.parse_expr_list()?
+            };
+            self.expect(&Token::RightParen)?;
+            let alias = if self.current() == &Token::As {
+                self.advance();
+                Some(self.expect_identifier()?)
+            } else if let Token::Identifier(_) = self.current() {
+                Some(self.expect_identifier()?)
+            } else {
+                None
+            };
+            return Ok(FromClause::TableFunction { name, args, alias });
+        }
+
         let alias = if self.current() == &Token::As {
             self.advance();
             Some(self.expect_identifier()?)
@@ -759,6 +782,12 @@ impl Parser {
             return self.parse_create_index(true);
         }
 
+        // CREATE VIRTUAL TABLE ...
+        if self.current() == &Token::Virtual {
+            self.advance();
+            return self.parse_create_virtual_table();
+        }
+
         match self.current() {
             Token::Table => self.parse_create_table(),
             Token::Index => self.parse_create_index(false),
@@ -769,6 +798,31 @@ impl Parser {
                 self.current()
             ))),
         }
+    }
+
+    /// Parse `CREATE VIRTUAL TABLE [IF NOT EXISTS] name USING module(arg1, arg2, ...)`
+    fn parse_create_virtual_table(&mut self) -> Result<Statement> {
+        self.expect(&Token::Table)?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.expect_identifier()?;
+        self.expect(&Token::Using)?;
+        let module_name = self.expect_identifier()?;
+        self.expect(&Token::LeftParen)?;
+        let mut args = Vec::new();
+        if self.current() != &Token::RightParen {
+            args.push(self.expect_identifier()?);
+            while self.current() == &Token::Comma {
+                self.advance();
+                args.push(self.expect_identifier()?);
+            }
+        }
+        self.expect(&Token::RightParen)?;
+        Ok(Statement::CreateVirtualTable(CreateVirtualTableStatement {
+            name,
+            if_not_exists,
+            module_name,
+            module_args: args,
+        }))
     }
 
     fn parse_create_table(&mut self) -> Result<Statement> {
@@ -1420,6 +1474,14 @@ impl Parser {
                         expr: Box::new(left),
                         pattern: Box::new(pattern),
                         negated: false,
+                    };
+                }
+                Token::Match => {
+                    self.advance();
+                    let pattern = self.parse_bitor_expr()?;
+                    left = Expr::Match {
+                        table: Box::new(left),
+                        pattern: Box::new(pattern),
                     };
                 }
                 Token::Not => {
@@ -2081,15 +2143,22 @@ impl Parser {
     fn parse_explain(&mut self) -> Result<Statement> {
         self.expect(&Token::Explain)?;
         // Optional QUERY PLAN
-        if self.current() == &Token::Query {
+        let is_query_plan = if self.current() == &Token::Query {
             self.advance();
             // Expect PLAN
             if self.current() == &Token::Plan {
                 self.advance();
             }
-        }
+            true
+        } else {
+            false
+        };
         let inner = self.parse_statement()?;
-        Ok(Statement::Explain(Box::new(inner)))
+        if is_query_plan {
+            Ok(Statement::ExplainQueryPlan(Box::new(inner)))
+        } else {
+            Ok(Statement::Explain(Box::new(inner)))
+        }
     }
 
     // =======================================================================
@@ -2885,10 +2954,10 @@ mod tests {
     #[test]
     fn parse_explain_query_plan() {
         let stmt = parse_one("EXPLAIN QUERY PLAN SELECT * FROM users WHERE id = 1");
-        if let Statement::Explain(inner) = stmt {
+        if let Statement::ExplainQueryPlan(inner) = stmt {
             assert!(matches!(*inner, Statement::Select(_)));
         } else {
-            panic!("expected Explain");
+            panic!("expected ExplainQueryPlan");
         }
     }
 

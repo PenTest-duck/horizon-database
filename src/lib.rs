@@ -151,7 +151,8 @@ impl Database {
         match &stmts[0] {
             sql::ast::Statement::Select(_)
             | sql::ast::Statement::Pragma(_)
-            | sql::ast::Statement::Explain(_) => {
+            | sql::ast::Statement::Explain(_)
+            | sql::ast::Statement::ExplainQueryPlan(_) => {
                 execution::execute_query(&stmts[0], buffer_pool, catalog, txn_manager)
             }
             stmt if execution::has_returning(stmt) => {

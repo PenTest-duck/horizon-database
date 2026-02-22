@@ -1874,10 +1874,14 @@ fn explain_select() {
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
     let result = db.query("EXPLAIN SELECT * FROM t").unwrap();
     assert!(!result.is_empty());
-    assert_eq!(result.columns[0], "detail");
-    let all_text: String = result.rows.iter().map(|r| r.values[0].as_text().unwrap().to_string()).collect::<Vec<_>>().join("\n");
-    assert!(all_text.contains("SCAN TABLE t"));
-    assert!(all_text.contains("PROJECT"));
+    assert_eq!(result.columns[0], "addr");
+    assert_eq!(result.columns[1], "opcode");
+    // Collect all opcodes
+    let opcodes: Vec<String> = result.rows.iter()
+        .filter_map(|r| r.get("opcode").and_then(|v| v.as_text()).map(|s| s.to_string()))
+        .collect();
+    assert!(opcodes.contains(&"OpenRead".to_string()) || opcodes.contains(&"Rewind".to_string()));
+    assert!(opcodes.contains(&"ResultRow".to_string()));
 }
 
 #[test]
@@ -1885,25 +1889,30 @@ fn explain_select_with_where() {
     let (_dir, db) = open_db();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
     let result = db.query("EXPLAIN SELECT * FROM t WHERE val > 5").unwrap();
-    let all_text: String = result.rows.iter().map(|r| r.values[0].as_text().unwrap().to_string()).collect::<Vec<_>>().join("\n");
-    assert!(all_text.contains("FILTER"));
-    assert!(all_text.contains("SCAN TABLE t"));
+    let opcodes: Vec<String> = result.rows.iter()
+        .filter_map(|r| r.get("opcode").and_then(|v| v.as_text()).map(|s| s.to_string()))
+        .collect();
+    assert!(opcodes.contains(&"Filter".to_string()));
 }
 
 #[test]
 fn explain_insert() {
     let (_dir, db) = open_db();
     let result = db.query("EXPLAIN INSERT INTO t VALUES (1, 'x')").unwrap();
-    let all_text: String = result.rows.iter().map(|r| r.values[0].as_text().unwrap().to_string()).collect::<Vec<_>>().join("\n");
-    assert!(all_text.contains("INSERT INTO t"));
+    let opcodes: Vec<String> = result.rows.iter()
+        .filter_map(|r| r.get("opcode").and_then(|v| v.as_text()).map(|s| s.to_string()))
+        .collect();
+    assert!(opcodes.contains(&"Insert".to_string()));
 }
 
 #[test]
 fn explain_create_table() {
     let (_dir, db) = open_db();
     let result = db.query("EXPLAIN CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
-    let all_text: String = result.rows.iter().map(|r| r.values[0].as_text().unwrap().to_string()).collect::<Vec<_>>().join("\n");
-    assert!(all_text.contains("CREATE TABLE t"));
+    let opcodes: Vec<String> = result.rows.iter()
+        .filter_map(|r| r.get("opcode").and_then(|v| v.as_text()).map(|s| s.to_string()))
+        .collect();
+    assert!(opcodes.contains(&"CreateTable".to_string()));
 }
 
 // ====================================================================
@@ -3844,4 +3853,660 @@ fn trigger_before_and_after_on_same_table() {
     let msgs: Vec<&Value> = result.rows.iter().map(|r| r.get("msg").unwrap()).collect();
     assert!(msgs.contains(&&Value::Text("before".to_string())));
     assert!(msgs.contains(&&Value::Text("after".to_string())));
+}
+
+// ===========================================================================
+// R-tree spatial indexing tests
+// ===========================================================================
+
+#[test]
+fn rtree_create_virtual_table() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+    // Table should exist; selecting from it returns zero rows.
+    let result = db.query("SELECT * FROM demo_index").unwrap();
+    assert_eq!(result.len(), 0);
+    assert_eq!(result.columns.len(), 5);
+    assert_eq!(result.columns[0], "id");
+    assert_eq!(result.columns[1], "minX");
+    assert_eq!(result.columns[2], "maxX");
+    assert_eq!(result.columns[3], "minY");
+    assert_eq!(result.columns[4], "maxY");
+}
+
+#[test]
+fn rtree_insert_and_select_all() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+    let affected = db.execute("INSERT INTO demo_index VALUES (1, 0.0, 10.0, 0.0, 20.0)").unwrap();
+    assert_eq!(affected, 1);
+
+    db.execute("INSERT INTO demo_index VALUES (2, 5.0, 15.0, 5.0, 25.0)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (3, 20.0, 30.0, 20.0, 30.0)").unwrap();
+
+    let result = db.query("SELECT * FROM demo_index").unwrap();
+    assert_eq!(result.len(), 3);
+
+    // Check that values are correct
+    let row = &result.rows[0];
+    assert_eq!(row.get("id"), Some(&Value::Integer(1)));
+    assert_eq!(row.get("minX"), Some(&Value::Real(0.0)));
+    assert_eq!(row.get("maxX"), Some(&Value::Real(10.0)));
+    assert_eq!(row.get("minY"), Some(&Value::Real(0.0)));
+    assert_eq!(row.get("maxY"), Some(&Value::Real(20.0)));
+}
+
+#[test]
+fn rtree_spatial_range_query_2d() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+
+    // Insert several rectangles
+    db.execute("INSERT INTO demo_index VALUES (1, 0.0, 10.0, 0.0, 10.0)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (2, 5.0, 15.0, 5.0, 15.0)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (3, 20.0, 30.0, 20.0, 30.0)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (4, 8.0, 12.0, 8.0, 12.0)").unwrap();
+
+    // Query: find rectangles overlapping with query rect [3, 11] x [3, 11]
+    // Overlap condition: entry.minX <= 11 AND entry.maxX >= 3 AND entry.minY <= 11 AND entry.maxY >= 3
+    let result = db.query(
+        "SELECT * FROM demo_index WHERE minX <= 11.0 AND maxX >= 3.0 AND minY <= 11.0 AND maxY >= 3.0"
+    ).unwrap();
+
+    // Rectangle 1: [0,10]x[0,10] overlaps [3,11]x[3,11] -> yes
+    // Rectangle 2: [5,15]x[5,15] overlaps [3,11]x[3,11] -> yes
+    // Rectangle 3: [20,30]x[20,30] overlaps [3,11]x[3,11] -> no (too far right/up)
+    // Rectangle 4: [8,12]x[8,12] overlaps [3,11]x[3,11] -> yes
+    assert_eq!(result.len(), 3);
+
+    let ids: Vec<i64> = result.rows.iter().map(|r| {
+        match r.get("id").unwrap() {
+            Value::Integer(i) => *i,
+            _ => panic!("expected integer id"),
+        }
+    }).collect();
+
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&2));
+    assert!(ids.contains(&4));
+    assert!(!ids.contains(&3));
+}
+
+#[test]
+fn rtree_1d_index() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE range_idx USING rtree(id, minVal, maxVal)").unwrap();
+
+    db.execute("INSERT INTO range_idx VALUES (1, 0.0, 10.0)").unwrap();
+    db.execute("INSERT INTO range_idx VALUES (2, 5.0, 15.0)").unwrap();
+    db.execute("INSERT INTO range_idx VALUES (3, 20.0, 30.0)").unwrap();
+
+    // Find ranges overlapping with [8, 12]
+    // Overlap: entry.minVal <= 12 AND entry.maxVal >= 8
+    let result = db.query(
+        "SELECT * FROM range_idx WHERE minVal <= 12.0 AND maxVal >= 8.0"
+    ).unwrap();
+
+    // Range 1: [0,10] overlaps [8,12] -> yes
+    // Range 2: [5,15] overlaps [8,12] -> yes
+    // Range 3: [20,30] overlaps [8,12] -> no
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.columns.len(), 3);
+}
+
+#[test]
+fn rtree_3d_index() {
+    let (_dir, db) = open_db();
+    db.execute(
+        "CREATE VIRTUAL TABLE spatial3d USING rtree(id, minX, maxX, minY, maxY, minZ, maxZ)"
+    ).unwrap();
+
+    db.execute("INSERT INTO spatial3d VALUES (1, 0.0, 10.0, 0.0, 10.0, 0.0, 10.0)").unwrap();
+    db.execute("INSERT INTO spatial3d VALUES (2, 5.0, 15.0, 5.0, 15.0, 5.0, 15.0)").unwrap();
+    db.execute("INSERT INTO spatial3d VALUES (3, 20.0, 30.0, 20.0, 30.0, 20.0, 30.0)").unwrap();
+
+    let result = db.query("SELECT * FROM spatial3d").unwrap();
+    assert_eq!(result.len(), 3);
+    assert_eq!(result.columns.len(), 7);
+
+    // 3D overlap query: find boxes overlapping with [4, 11] x [4, 11] x [4, 11]
+    let result = db.query(
+        "SELECT * FROM spatial3d WHERE minX <= 11.0 AND maxX >= 4.0 AND minY <= 11.0 AND maxY >= 4.0 AND minZ <= 11.0 AND maxZ >= 4.0"
+    ).unwrap();
+    assert_eq!(result.len(), 2); // entries 1 and 2
+}
+
+#[test]
+fn rtree_delete_by_id() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (1, 0.0, 10.0, 0.0, 10.0)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (2, 5.0, 15.0, 5.0, 15.0)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (3, 20.0, 30.0, 20.0, 30.0)").unwrap();
+
+    let deleted = db.execute("DELETE FROM demo_index WHERE id = 2").unwrap();
+    assert_eq!(deleted, 1);
+
+    let result = db.query("SELECT * FROM demo_index").unwrap();
+    assert_eq!(result.len(), 2);
+
+    let ids: Vec<i64> = result.rows.iter().map(|r| {
+        match r.get("id").unwrap() {
+            Value::Integer(i) => *i,
+            _ => panic!("expected integer id"),
+        }
+    }).collect();
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&3));
+    assert!(!ids.contains(&2));
+}
+
+#[test]
+fn rtree_empty_result_query() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (1, 0.0, 10.0, 0.0, 10.0)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (2, 5.0, 15.0, 5.0, 15.0)").unwrap();
+
+    // Query a region that doesn't overlap with any entry
+    let result = db.query(
+        "SELECT * FROM demo_index WHERE minX <= -100.0 AND maxX >= -50.0"
+    ).unwrap();
+    assert_eq!(result.len(), 0);
+}
+
+#[test]
+fn rtree_boundary_overlap() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (1, 0.0, 10.0, 0.0, 10.0)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (2, 10.0, 20.0, 0.0, 10.0)").unwrap();
+
+    // Query exactly at the boundary: [10, 10] x [0, 10]
+    // Entry 1: [0,10]x[0,10] -> minX <= 10 AND maxX >= 10 -> 0<=10 yes, 10>=10 yes -> overlap
+    // Entry 2: [10,20]x[0,10] -> minX <= 10 AND maxX >= 10 -> 10<=10 yes, 20>=10 yes -> overlap
+    let result = db.query(
+        "SELECT * FROM demo_index WHERE minX <= 10.0 AND maxX >= 10.0 AND minY <= 10.0 AND maxY >= 0.0"
+    ).unwrap();
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn rtree_delete_all() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (1, 0.0, 10.0, 0.0, 10.0)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (2, 5.0, 15.0, 5.0, 15.0)").unwrap();
+
+    // Delete all entries
+    let deleted = db.execute("DELETE FROM demo_index").unwrap();
+    assert_eq!(deleted, 2);
+
+    let result = db.query("SELECT * FROM demo_index").unwrap();
+    assert_eq!(result.len(), 0);
+}
+
+#[test]
+fn rtree_insert_with_integer_coordinates() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+
+    // Insert with integer coordinates (should be accepted and converted to real)
+    db.execute("INSERT INTO demo_index VALUES (1, 0, 10, 0, 20)").unwrap();
+
+    let result = db.query("SELECT * FROM demo_index").unwrap();
+    assert_eq!(result.len(), 1);
+    let row = &result.rows[0];
+    assert_eq!(row.get("id"), Some(&Value::Integer(1)));
+    assert_eq!(row.get("minX"), Some(&Value::Real(0.0)));
+    assert_eq!(row.get("maxX"), Some(&Value::Real(10.0)));
+}
+
+#[test]
+fn rtree_select_specific_columns() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (1, 0.0, 10.0, 0.0, 20.0)").unwrap();
+    db.execute("INSERT INTO demo_index VALUES (2, 5.0, 15.0, 5.0, 25.0)").unwrap();
+
+    let result = db.query("SELECT id, minX FROM demo_index").unwrap();
+    assert_eq!(result.columns.len(), 2);
+    assert_eq!(result.columns[0], "id");
+    assert_eq!(result.columns[1], "minX");
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn rtree_if_not_exists() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+    // Creating again with IF NOT EXISTS should succeed silently
+    db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS demo_index USING rtree(id, minX, maxX, minY, maxY)").unwrap();
+
+    // Creating again without IF NOT EXISTS should fail
+    let result = db.execute("CREATE VIRTUAL TABLE demo_index USING rtree(id, minX, maxX, minY, maxY)");
+    assert!(result.is_err());
+}
+
+// ===========================================================================
+// EXPLAIN / EXPLAIN QUERY PLAN tests (new format with opcode columns)
+// ===========================================================================
+
+#[test]
+fn explain_select_returns_opcode_columns() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+
+    let result = db.query("EXPLAIN SELECT * FROM users").unwrap();
+    assert_eq!(result.columns.len(), 6);
+    assert_eq!(result.columns[0], "addr");
+    assert_eq!(result.columns[1], "opcode");
+    assert_eq!(result.columns[2], "p1");
+    assert_eq!(result.columns[3], "p2");
+    assert_eq!(result.columns[4], "p3");
+    assert_eq!(result.columns[5], "p4");
+    assert!(!result.is_empty());
+
+    // Check that addr values are sequential integers starting from 0
+    let first_addr = result.rows[0].get("addr").unwrap();
+    assert_eq!(*first_addr, Value::Integer(0));
+
+    // Check that opcode is a non-empty text value
+    let first_opcode = result.rows[0].get("opcode").unwrap();
+    if let Value::Text(op) = first_opcode {
+        assert!(!op.is_empty());
+    } else {
+        panic!("opcode should be Text");
+    }
+}
+
+#[test]
+fn explain_query_plan_select() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+
+    let result = db.query("EXPLAIN QUERY PLAN SELECT * FROM users").unwrap();
+    assert_eq!(result.columns.len(), 4);
+    assert_eq!(result.columns[0], "selectid");
+    assert_eq!(result.columns[1], "order");
+    assert_eq!(result.columns[2], "from");
+    assert_eq!(result.columns[3], "detail");
+    assert!(!result.is_empty());
+
+    // The detail column should mention SCAN TABLE users
+    let detail = result.rows[0].get("detail").unwrap();
+    if let Value::Text(d) = detail {
+        assert!(d.contains("SCAN TABLE"), "expected 'SCAN TABLE' in detail, got: {}", d);
+        assert!(d.contains("users"), "expected 'users' in detail, got: {}", d);
+    } else {
+        panic!("detail should be Text");
+    }
+}
+
+#[test]
+fn explain_query_plan_with_order_by() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+
+    let result = db.query("EXPLAIN QUERY PLAN SELECT * FROM items ORDER BY name").unwrap();
+    let details: Vec<String> = result.rows.iter()
+        .filter_map(|r| match r.get("detail").unwrap() {
+            Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(details.iter().any(|d| d.contains("ORDER BY")),
+        "expected ORDER BY detail, got: {:?}", details);
+}
+
+#[test]
+fn explain_query_plan_join() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)").unwrap();
+
+    let result = db.query("EXPLAIN QUERY PLAN SELECT * FROM a INNER JOIN b ON a.id = b.a_id").unwrap();
+    let details: Vec<String> = result.rows.iter()
+        .filter_map(|r| match r.get("detail").unwrap() {
+            Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(details.iter().any(|d| d.contains("SCAN TABLE a")),
+        "expected scan of table a, got: {:?}", details);
+    assert!(details.iter().any(|d| d.contains("SCAN TABLE b")),
+        "expected scan of table b, got: {:?}", details);
+}
+
+// ===========================================================================
+// Additional PRAGMA tests (new pragmas)
+// ===========================================================================
+
+#[test]
+fn pragma_table_list_columns() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE alpha (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE beta (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+
+    let result = db.query("PRAGMA table_list").unwrap();
+    assert_eq!(result.columns.len(), 6);
+    assert_eq!(result.columns[0], "schema");
+    assert_eq!(result.columns[1], "name");
+    assert_eq!(result.columns[2], "type");
+    assert_eq!(result.columns[3], "ncol");
+    assert_eq!(result.columns[4], "wr");
+    assert_eq!(result.columns[5], "strict");
+    assert!(result.len() >= 2);
+
+    let names: Vec<String> = result.rows.iter()
+        .filter_map(|r| match r.get("name").unwrap() {
+            Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&"alpha".to_string()));
+    assert!(names.contains(&"beta".to_string()));
+
+    for row in &result.rows {
+        if let Value::Text(name) = row.get("name").unwrap() {
+            if name == "alpha" {
+                assert_eq!(*row.get("ncol").unwrap(), Value::Integer(1));
+            } else if name == "beta" {
+                assert_eq!(*row.get("ncol").unwrap(), Value::Integer(2));
+            }
+            assert_eq!(*row.get("schema").unwrap(), Value::Text("main".into()));
+            assert_eq!(*row.get("type").unwrap(), Value::Text("table".into()));
+        }
+    }
+}
+
+#[test]
+fn pragma_index_info_columns() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)").unwrap();
+    db.execute("CREATE INDEX idx_name ON users (name)").unwrap();
+
+    let result = db.query("PRAGMA index_info(idx_name)").unwrap();
+    assert_eq!(result.columns.len(), 3);
+    assert_eq!(result.columns[0], "seqno");
+    assert_eq!(result.columns[1], "cid");
+    assert_eq!(result.columns[2], "name");
+    assert_eq!(result.len(), 1);
+
+    let row = &result.rows[0];
+    assert_eq!(*row.get("seqno").unwrap(), Value::Integer(0));
+    assert_eq!(*row.get("name").unwrap(), Value::Text("name".into()));
+    assert_eq!(*row.get("cid").unwrap(), Value::Integer(1));
+}
+
+#[test]
+fn pragma_journal_mode_returns_wal() {
+    let (_dir, db) = open_db();
+
+    let result = db.query("PRAGMA journal_mode").unwrap();
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0], "journal_mode");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Text("wal".into()));
+}
+
+#[test]
+fn pragma_encoding_returns_utf8() {
+    let (_dir, db) = open_db();
+
+    let result = db.query("PRAGMA encoding").unwrap();
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0], "encoding");
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Text("UTF-8".into()));
+}
+
+// ---- FTS5 (Full-Text Search) Integration Tests ----
+
+#[test]
+fn fts5_create_virtual_table() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts_cvt_emails USING fts5(sender, subject, body)").unwrap();
+    // Creating the same table without IF NOT EXISTS should fail
+    let result = db.execute("CREATE VIRTUAL TABLE fts_cvt_emails USING fts5(sender, subject, body)");
+    assert!(result.is_err());
+}
+
+#[test]
+fn fts5_create_if_not_exists() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts_ine_emails USING fts5(sender, subject, body)").unwrap();
+    // IF NOT EXISTS should succeed silently
+    db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS fts_ine_emails USING fts5(sender, subject, body)").unwrap();
+}
+
+#[test]
+fn fts5_insert_and_select_all() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_docs USING fts5(title, content)").unwrap();
+    db.execute("INSERT INTO fts5_docs VALUES ('Rust Programming', 'Rust is a systems programming language')").unwrap();
+    db.execute("INSERT INTO fts5_docs VALUES ('Python Guide', 'Python is great for scripting')").unwrap();
+
+    let result = db.query("SELECT * FROM fts5_docs").unwrap();
+    assert_eq!(result.len(), 2);
+    // Columns should be: title, content, rank
+    assert!(result.columns.contains(&"title".to_string()));
+    assert!(result.columns.contains(&"content".to_string()));
+}
+
+#[test]
+fn fts5_match_query_basic() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_articles USING fts5(title, body)").unwrap();
+    db.execute("INSERT INTO fts5_articles VALUES ('Database Systems', 'B-trees are fundamental data structures')").unwrap();
+    db.execute("INSERT INTO fts5_articles VALUES ('Web Development', 'JavaScript runs in browsers')").unwrap();
+    db.execute("INSERT INTO fts5_articles VALUES ('Database Design', 'Normalization reduces data redundancy')").unwrap();
+
+    // MATCH query should only return documents containing "database"
+    let result = db.query("SELECT title FROM fts5_articles WHERE fts5_articles MATCH 'database'").unwrap();
+    assert_eq!(result.len(), 2);
+    let titles: Vec<String> = result.rows.iter().map(|r| {
+        match r.get("title").unwrap() {
+            Value::Text(s) => s.clone(),
+            _ => panic!("expected text"),
+        }
+    }).collect();
+    assert!(titles.contains(&"Database Systems".to_string()));
+    assert!(titles.contains(&"Database Design".to_string()));
+}
+
+#[test]
+fn fts5_multi_term_search_and_semantics() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_notes USING fts5(title, body)").unwrap();
+    db.execute("INSERT INTO fts5_notes VALUES ('Rust Book', 'Learn rust programming language basics')").unwrap();
+    db.execute("INSERT INTO fts5_notes VALUES ('Rust Advanced', 'Advanced rust patterns and idioms')").unwrap();
+    db.execute("INSERT INTO fts5_notes VALUES ('Python Book', 'Learn python programming language')").unwrap();
+
+    // Multi-term query: all terms must be present (AND semantics)
+    let result = db.query("SELECT title FROM fts5_notes WHERE fts5_notes MATCH 'rust learn'").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].get("title").unwrap(), &Value::Text("Rust Book".to_string()));
+}
+
+#[test]
+fn fts5_table_function_syntax() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_items USING fts5(name, description)").unwrap();
+    db.execute("INSERT INTO fts5_items VALUES ('Widget', 'A small useful gadget')").unwrap();
+    db.execute("INSERT INTO fts5_items VALUES ('Gizmo', 'An electronic device')").unwrap();
+    db.execute("INSERT INTO fts5_items VALUES ('Gadget', 'Another useful gadget tool')").unwrap();
+
+    // Table function syntax: FROM table('query')
+    let result = db.query("SELECT name FROM fts5_items('gadget')").unwrap();
+    assert_eq!(result.len(), 2);
+    let names: Vec<String> = result.rows.iter().map(|r| {
+        match r.get("name").unwrap() {
+            Value::Text(s) => s.clone(),
+            _ => panic!("expected text"),
+        }
+    }).collect();
+    assert!(names.contains(&"Widget".to_string()));
+    assert!(names.contains(&"Gadget".to_string()));
+}
+
+#[test]
+fn fts5_rank_column() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_pages USING fts5(title, content)").unwrap();
+    db.execute("INSERT INTO fts5_pages VALUES ('Rust Intro', 'Rust is a language')").unwrap();
+    db.execute("INSERT INTO fts5_pages VALUES ('Rust Deep', 'Rust rust rust everywhere rust')").unwrap();
+
+    // Query with rank column - documents with more term occurrences should have higher relevance
+    let result = db.query("SELECT title, rank FROM fts5_pages WHERE fts5_pages MATCH 'rust'").unwrap();
+    assert_eq!(result.len(), 2);
+    // Both should have rank values
+    for row in &result.rows {
+        let rank = row.get("rank").unwrap();
+        match rank {
+            Value::Real(_) => {} // expected
+            _ => panic!("expected rank to be Real, got {:?}", rank),
+        }
+    }
+}
+
+#[test]
+fn fts5_highlight_function() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_corpus USING fts5(text)").unwrap();
+    db.execute("INSERT INTO fts5_corpus VALUES ('The quick brown fox jumps over the lazy dog')").unwrap();
+
+    let result = db.query("SELECT highlight(fts5_corpus, 0, '<b>', '</b>') FROM fts5_corpus WHERE fts5_corpus MATCH 'fox'").unwrap();
+    assert_eq!(result.len(), 1);
+    let highlighted = match &result.rows[0].values[0] {
+        Value::Text(s) => s.clone(),
+        other => panic!("expected Text, got {:?}", other),
+    };
+    assert!(highlighted.contains("<b>fox</b>"), "highlighted text should contain <b>fox</b>, got: {}", highlighted);
+}
+
+#[test]
+fn fts5_snippet_function() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_essays USING fts5(text)").unwrap();
+    db.execute("INSERT INTO fts5_essays VALUES ('The quick brown fox jumps over the lazy dog and then the fox runs away to the forest where many other animals live')").unwrap();
+
+    let result = db.query("SELECT snippet(fts5_essays, 0, '[', ']', '...', 8) FROM fts5_essays WHERE fts5_essays MATCH 'fox'").unwrap();
+    assert_eq!(result.len(), 1);
+    let snippet_val = match &result.rows[0].values[0] {
+        Value::Text(s) => s.clone(),
+        other => panic!("expected Text, got {:?}", other),
+    };
+    // The snippet should contain the highlighted match
+    assert!(snippet_val.contains("[fox]"), "snippet should contain [fox], got: {}", snippet_val);
+}
+
+#[test]
+fn fts5_bm25_function() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE docs2 USING fts5(title, body)").unwrap();
+    db.execute("INSERT INTO docs2 VALUES ('First', 'rust programming language')").unwrap();
+    db.execute("INSERT INTO docs2 VALUES ('Second', 'rust rust rust is great')").unwrap();
+
+    let result = db.query("SELECT title, bm25(docs2) FROM docs2 WHERE docs2 MATCH 'rust'").unwrap();
+    assert_eq!(result.len(), 2);
+    for row in &result.rows {
+        let bm25_val = &row.values[1];
+        match bm25_val {
+            Value::Real(f) => assert!(*f >= 0.0, "bm25 should be non-negative"),
+            _ => panic!("expected Real from bm25(), got {:?}", bm25_val),
+        }
+    }
+}
+
+#[test]
+fn fts5_delete_and_requery() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_logs USING fts5(message)").unwrap();
+    db.execute("INSERT INTO fts5_logs VALUES ('error occurred in module A')").unwrap();
+    db.execute("INSERT INTO fts5_logs VALUES ('warning about disk space')").unwrap();
+    db.execute("INSERT INTO fts5_logs VALUES ('error in network connection')").unwrap();
+
+    // Verify initial data
+    let result = db.query("SELECT * FROM fts5_logs WHERE fts5_logs MATCH 'error'").unwrap();
+    assert_eq!(result.len(), 2);
+
+    // Delete matching rows
+    db.execute("DELETE FROM fts5_logs WHERE fts5_logs MATCH 'error'").unwrap();
+
+    // After delete, no rows should match 'error'
+    let result = db.query("SELECT * FROM fts5_logs WHERE fts5_logs MATCH 'error'").unwrap();
+    assert_eq!(result.len(), 0);
+
+    // The warning row should still be there
+    let result = db.query("SELECT * FROM fts5_logs WHERE fts5_logs MATCH 'warning'").unwrap();
+    assert_eq!(result.len(), 1);
+}
+
+#[test]
+fn fts5_drop_table() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE temp_fts USING fts5(content)").unwrap();
+    db.execute("INSERT INTO temp_fts VALUES ('some text')").unwrap();
+
+    // Drop the FTS5 table
+    db.execute("DROP TABLE temp_fts").unwrap();
+
+    // Querying the dropped table should fail
+    let result = db.query("SELECT * FROM temp_fts");
+    assert!(result.is_err());
+}
+
+#[test]
+fn fts5_delete_all_rows() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_tmp USING fts5(val)").unwrap();
+    db.execute("INSERT INTO fts5_tmp VALUES ('alpha')").unwrap();
+    db.execute("INSERT INTO fts5_tmp VALUES ('beta')").unwrap();
+    db.execute("INSERT INTO fts5_tmp VALUES ('gamma')").unwrap();
+
+    // DELETE without WHERE removes all rows
+    db.execute("DELETE FROM fts5_tmp").unwrap();
+
+    let result = db.query("SELECT * FROM fts5_tmp").unwrap();
+    assert_eq!(result.len(), 0);
+}
+
+#[test]
+fn fts5_multiple_inserts_and_search() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_books USING fts5(title, author, summary)").unwrap();
+    db.execute("INSERT INTO fts5_books VALUES ('The Rust Book', 'Steve Klabnik', 'Official guide to Rust programming')").unwrap();
+    db.execute("INSERT INTO fts5_books VALUES ('Programming Rust', 'Jim Blandy', 'Comprehensive Rust reference book')").unwrap();
+    db.execute("INSERT INTO fts5_books VALUES ('Python Crash Course', 'Eric Matthes', 'Hands-on introduction to Python')").unwrap();
+    db.execute("INSERT INTO fts5_books VALUES ('Fluent Python', 'Luciano Ramalho', 'Advanced Python programming techniques')").unwrap();
+
+    // Search for 'rust' - should find 2 books
+    let result = db.query("SELECT title FROM fts5_books WHERE fts5_books MATCH 'rust'").unwrap();
+    assert_eq!(result.len(), 2);
+
+    // Search for 'programming' - should find 3 books
+    let result = db.query("SELECT title FROM fts5_books WHERE fts5_books MATCH 'programming'").unwrap();
+    assert_eq!(result.len(), 3);
+
+    // Search for 'python programming' (AND semantics) - should find books with both terms
+    let result = db.query("SELECT title FROM fts5_books WHERE fts5_books MATCH 'python programming'").unwrap();
+    assert_eq!(result.len(), 1);
+    // "Fluent Python" has 'python' in title and 'programming' in summary
+    assert_eq!(result.rows[0].get("title").unwrap(), &Value::Text("Fluent Python".to_string()));
+}
+
+#[test]
+fn fts5_case_insensitive_search() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE VIRTUAL TABLE fts5_ci_test USING fts5(text)").unwrap();
+    db.execute("INSERT INTO fts5_ci_test VALUES ('Hello World')").unwrap();
+    db.execute("INSERT INTO fts5_ci_test VALUES ('HELLO UNIVERSE')").unwrap();
+
+    // Search is case-insensitive (tokenizer lowercases everything)
+    let result = db.query("SELECT * FROM fts5_ci_test WHERE fts5_ci_test MATCH 'hello'").unwrap();
+    assert_eq!(result.len(), 2);
+
+    let result = db.query("SELECT * FROM fts5_ci_test WHERE fts5_ci_test MATCH 'HELLO'").unwrap();
+    assert_eq!(result.len(), 2);
 }

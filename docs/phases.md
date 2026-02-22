@@ -56,20 +56,20 @@
 ## Phase 6: Extensions
 - [x] Built-in scalar functions (string, math, date/time)
 - [x] JSON functions (json_extract, json_array, etc.)
-- [ ] FTS5 (Full-Text Search)
-- [ ] R-tree (spatial indexing)
+- [x] FTS5 (Full-Text Search)
+- [x] R-tree (spatial indexing)
 - [x] Generated columns (STORED, VIRTUAL)
-- [ ] Virtual tables framework
-- [ ] EXPLAIN / EXPLAIN QUERY PLAN
+- [x] Virtual tables framework (FTS5, R-tree)
+- [x] EXPLAIN / EXPLAIN QUERY PLAN
 - [x] ATTACH DATABASE
 - [x] VACUUM
-- [ ] PRAGMA commands
+- [x] PRAGMA commands
 
 ## Phase 7: CLI & Polish
 - [x] Interactive REPL with line editing
 - [x] Dot-commands (.tables, .schema, .import, .dump)
 - [x] CSV import/export
 - [x] SQL dump import/export
-- [ ] Performance benchmarks
-- [x] Comprehensive test suite (594 tests)
+- [x] Performance benchmarks (Criterion)
+- [x] Comprehensive test suite (645 tests)
 - [ ] Documentation

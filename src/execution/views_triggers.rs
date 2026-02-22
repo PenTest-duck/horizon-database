@@ -165,6 +165,15 @@ fn from_clause_to_sql(from: &FromClause) -> String {
         FromClause::Subquery { query, alias } => {
             format!("({}) AS {}", select_to_sql(query), alias)
         }
+        FromClause::TableFunction { name, args, alias } => {
+            let args_str: Vec<String> = args.iter().map(|a| expr_to_sql(a)).collect();
+            let base = format!("{}({})", name, args_str.join(", "));
+            if let Some(ref a) = alias {
+                format!("{} AS {}", base, a)
+            } else {
+                base
+            }
+        }
     }
 }
 
@@ -211,6 +220,9 @@ fn expr_to_sql(expr: &Expr) -> String {
         Expr::Like { expr: inner, pattern, negated } => {
             if *negated { format!("({} NOT LIKE {})", expr_to_sql(inner), expr_to_sql(pattern)) }
             else { format!("({} LIKE {})", expr_to_sql(inner), expr_to_sql(pattern)) }
+        }
+        Expr::Match { table, pattern } => {
+            format!("({} MATCH {})", expr_to_sql(table), expr_to_sql(pattern))
         }
         Expr::Function { name, args, distinct } => {
             let a: Vec<String> = args.iter().map(|x| expr_to_sql(x)).collect();

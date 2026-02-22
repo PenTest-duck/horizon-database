@@ -153,6 +153,19 @@ pub struct AttachedDatabase {
     pub schema_name: String,
 }
 
+/// Metadata for an R-tree virtual table.
+#[derive(Debug, Clone)]
+pub struct RTreeInfo {
+    /// Virtual table name.
+    pub name: String,
+    /// Column names: first is the id column, then pairs of (min, max) for each dimension.
+    pub column_names: Vec<String>,
+    /// Number of spatial dimensions (1-5).
+    pub num_dimensions: usize,
+    /// Root page of the B+Tree used to store R-tree entries (keyed by rowid).
+    pub root_page: PageId,
+}
+
 /// The schema catalog -- tracks all tables and indexes in the database.
 pub struct Catalog {
     tables: HashMap<String, TableInfo>,
@@ -161,6 +174,8 @@ pub struct Catalog {
     triggers: HashMap<String, TriggerInfo>,
     /// Attached databases keyed by schema name.
     pub attached_databases: HashMap<String, AttachedDatabase>,
+    /// R-tree virtual tables keyed by name.
+    rtrees: HashMap<String, RTreeInfo>,
 }
 
 impl Catalog {
@@ -172,6 +187,7 @@ impl Catalog {
             views: HashMap::new(),
             triggers: HashMap::new(),
             attached_databases: HashMap::new(),
+            rtrees: HashMap::new(),
         }
     }
 
@@ -444,6 +460,40 @@ impl Catalog {
                     && t.timing == *timing
             })
             .collect()
+    }
+
+    // =================================================================
+    // R-tree virtual table operations
+    // =================================================================
+
+    /// Add an R-tree virtual table to the catalog (in-memory only).
+    pub fn create_rtree(&mut self, rtree: RTreeInfo) -> Result<()> {
+        if self.rtrees.contains_key(&rtree.name) || self.tables.contains_key(&rtree.name) {
+            return Err(HorizonError::DuplicateTable(rtree.name.clone()));
+        }
+        self.rtrees.insert(rtree.name.clone(), rtree);
+        Ok(())
+    }
+
+    /// Drop an R-tree virtual table from the catalog.
+    pub fn drop_rtree(&mut self, name: &str) -> Result<RTreeInfo> {
+        self.rtrees.remove(name)
+            .ok_or_else(|| HorizonError::TableNotFound(name.into()))
+    }
+
+    /// Check whether an R-tree virtual table with the given name exists.
+    pub fn rtree_exists(&self, name: &str) -> bool {
+        self.rtrees.contains_key(name)
+    }
+
+    /// Get an R-tree virtual table's metadata.
+    pub fn get_rtree(&self, name: &str) -> Option<&RTreeInfo> {
+        self.rtrees.get(name)
+    }
+
+    /// Get a mutable reference to an R-tree virtual table's metadata.
+    pub fn get_rtree_mut(&mut self, name: &str) -> Option<&mut RTreeInfo> {
+        self.rtrees.get_mut(name)
     }
 
     /// Rename a table in the catalog.

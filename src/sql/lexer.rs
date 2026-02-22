@@ -130,6 +130,8 @@ pub enum Token {
     Always,
     Stored,
     Virtual,
+    Using,
+    Match,
 
     // -----------------------------------------------------------------------
     // Literals
@@ -304,6 +306,8 @@ fn keyword_token(word: &str) -> Option<Token> {
         "ALWAYS" => Some(Token::Always),
         "STORED" => Some(Token::Stored),
         "VIRTUAL" => Some(Token::Virtual),
+        "USING" => Some(Token::Using),
+        "MATCH" => Some(Token::Match),
         _ => None,
     }
 }

@@ -102,8 +102,9 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<LogicalPlan
         Statement::CreateIndex(ci) => Ok(LogicalPlan::CreateIndex(ci.clone())),
         Statement::DropIndex(di) => Ok(LogicalPlan::DropIndex(di.clone())),
         Statement::AlterTable(_) => Err(HorizonError::NotImplemented("ALTER TABLE".into())),
-        Statement::Explain(_) => Err(HorizonError::NotImplemented("EXPLAIN".into())),
-        Statement::Pragma(_) => Err(HorizonError::NotImplemented("PRAGMA".into())),
+        Statement::Explain(inner) => plan_statement(inner, catalog),
+        Statement::ExplainQueryPlan(inner) => plan_statement(inner, catalog),
+        Statement::Pragma(_) => Ok(LogicalPlan::Empty),
         Statement::Begin => Ok(LogicalPlan::Begin),
         Statement::Commit => Ok(LogicalPlan::Commit),
         Statement::Rollback => Ok(LogicalPlan::Rollback),
@@ -114,6 +115,7 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<LogicalPlan
         Statement::AttachDatabase(_) => Err(HorizonError::NotImplemented("ATTACH DATABASE".into())),
         Statement::DetachDatabase(_) => Err(HorizonError::NotImplemented("DETACH DATABASE".into())),
         Statement::Vacuum => Err(HorizonError::NotImplemented("VACUUM".into())),
+        Statement::CreateVirtualTable(_) => Err(HorizonError::NotImplemented("CREATE VIRTUAL TABLE".into())),
     }
 }
 
@@ -202,6 +204,9 @@ fn plan_from(from: &FromClause) -> Result<LogicalPlan> {
         FromClause::Subquery { query: _, alias: _ } => {
             // TODO: Handle subqueries in FROM
             Err(HorizonError::NotImplemented("subquery in FROM clause".into()))
+        }
+        FromClause::TableFunction { .. } => {
+            Err(HorizonError::NotImplemented("table function in FROM clause".into()))
         }
     }
 }

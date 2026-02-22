@@ -4,6 +4,8 @@
 //! the SQL parser/planner with the B+Tree storage, catalog, and MVCC layers.
 
 pub mod json;
+pub mod rtree;
+pub mod fts5;
 mod views_triggers;
 
 use std::collections::HashMap;
@@ -33,9 +35,19 @@ pub fn execute_statement(
     match stmt {
         Statement::CreateTable(ct) => execute_create_table(ct, pool, catalog),
         Statement::DropTable(dt) => execute_drop_table(dt, pool, catalog),
-        Statement::Insert(ins) => execute_insert(ins, pool, catalog, txn_mgr),
+        Statement::Insert(ins) => {
+            if catalog.rtree_exists(&ins.table) {
+                return rtree::execute_rtree_insert(ins, pool, catalog);
+            }
+            execute_insert(ins, pool, catalog, txn_mgr)
+        }
         Statement::Update(upd) => execute_update(upd, pool, catalog, txn_mgr),
-        Statement::Delete(del) => execute_delete(del, pool, catalog, txn_mgr),
+        Statement::Delete(del) => {
+            if catalog.rtree_exists(&del.table) {
+                return rtree::execute_rtree_delete(del, pool, catalog);
+            }
+            execute_delete(del, pool, catalog, txn_mgr)
+        }
         Statement::CreateIndex(ci) => execute_create_index(ci, pool, catalog),
         Statement::DropIndex(di) => execute_drop_index(di, pool, catalog),
         Statement::Begin => {
@@ -74,6 +86,20 @@ pub fn execute_statement(
             Ok(0)
         }
         Statement::Vacuum => execute_vacuum(pool, catalog),
+        Statement::ExplainQueryPlan(_) => {
+            // EXPLAIN QUERY PLAN returns rows; handled in Database::query()
+            Err(HorizonError::Internal("use query() for EXPLAIN QUERY PLAN statements".into()))
+        }
+        Statement::CreateVirtualTable(cvt) => {
+            match cvt.module_name.to_lowercase().as_str() {
+                "fts5" => execute_create_fts5_table(cvt),
+                "rtree" => rtree::execute_create_virtual_table_rtree(cvt, pool, catalog),
+                _ => Err(HorizonError::InvalidSql(format!(
+                    "unknown virtual table module: {}",
+                    cvt.module_name
+                ))),
+            }
+        }
     }
 }
 
@@ -88,6 +114,7 @@ pub fn execute_query(
         Statement::Select(select) => execute_select(select, pool, catalog),
         Statement::Pragma(pragma) => execute_pragma(pragma, pool, catalog),
         Statement::Explain(inner) => execute_explain(inner, catalog),
+        Statement::ExplainQueryPlan(inner) => execute_explain_query_plan(inner, catalog),
         Statement::Insert(ins) if ins.returning.is_some() => {
             execute_insert_returning(ins, pool, catalog, txn_mgr)
         }
@@ -171,6 +198,18 @@ fn execute_create_table(
     Ok(0)
 }
 
+// ---- CREATE VIRTUAL TABLE (FTS5) ----
+
+fn execute_create_fts5_table(
+    cvt: &CreateVirtualTableStatement,
+) -> Result<usize> {
+    if cvt.if_not_exists && fts5::fts5_table_exists(&cvt.name) {
+        return Ok(0);
+    }
+    fts5::create_fts5_table(&cvt.name, cvt.module_args.clone())?;
+    Ok(0)
+}
+
 // ---- DROP TABLE ----
 
 fn execute_drop_table(
@@ -178,6 +217,11 @@ fn execute_drop_table(
     pool: &mut BufferPool,
     catalog: &mut Catalog,
 ) -> Result<usize> {
+    // Check if it's an FTS5 virtual table
+    if fts5::fts5_table_exists(&dt.name) {
+        fts5::fts5_drop_table(&dt.name)?;
+        return Ok(0);
+    }
     if dt.if_exists && !catalog.table_exists(&dt.name) {
         return Ok(0);
     }
@@ -231,6 +275,334 @@ fn execute_vacuum(
 
 
 
+// ---- FTS5 SELECT ----
+
+fn execute_fts5_select(
+    select: &SelectStatement,
+    table_name: &str,
+    table_fn_args: Option<&Vec<Expr>>,
+    _pool: &mut BufferPool,
+    _catalog: &mut Catalog,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let fts_columns = fts5::fts5_get_columns(table_name)?;
+
+    // Determine the search query
+    let query_text: Option<String> = if let Some(args) = table_fn_args {
+        // Table function syntax: FROM table('query')
+        if let Some(first_arg) = args.first() {
+            if let Expr::Literal(LiteralValue::String(s)) = first_arg {
+                Some(s.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else if let Some(ref where_clause) = select.where_clause {
+        // MATCH syntax: WHERE table MATCH 'query'
+        extract_fts5_match_query(where_clause, table_name)
+    } else {
+        None
+    };
+
+    // Build the result set
+    let _has_rank = select.columns.iter().any(|c| {
+        if let SelectColumn::Expr { expr: Expr::Column { name, .. }, .. } = c {
+            name.eq_ignore_ascii_case("rank")
+        } else {
+            false
+        }
+    }) || matches!(&select.columns[..], [SelectColumn::AllColumns]);
+
+    // Check for FTS5 auxiliary functions in the columns
+    let _has_fts_functions = select.columns.iter().any(|c| {
+        if let SelectColumn::Expr { expr: Expr::Function { name, .. }, .. } = c {
+            let upper = name.to_uppercase();
+            matches!(upper.as_str(), "HIGHLIGHT" | "SNIPPET" | "BM25")
+        } else {
+            false
+        }
+    });
+
+    let query_for_fns = query_text.clone().unwrap_or_default();
+
+    let rows_data: Vec<(i64, Vec<Value>, f64)> = if let Some(ref q) = query_text {
+        fts5::fts5_query(table_name, q)?
+    } else {
+        // Full scan
+        let all = fts5::fts5_scan_all(table_name)?;
+        all.into_iter().map(|(rid, vals)| (rid, vals, 0.0)).collect()
+    };
+
+    // Build column names from the select columns
+    let mut col_names: Vec<String> = Vec::new();
+    let mut rows: Vec<Vec<Value>> = Vec::new();
+
+    // Determine output column names
+    let is_star = select.columns.len() == 1 && matches!(select.columns[0], SelectColumn::AllColumns);
+    if is_star {
+        col_names = fts_columns.clone();
+        col_names.push("rank".to_string());
+    } else {
+        for sc in &select.columns {
+            match sc {
+                SelectColumn::AllColumns => {
+                    col_names.extend(fts_columns.clone());
+                    col_names.push("rank".to_string());
+                }
+                SelectColumn::TableAllColumns(_) => {
+                    col_names.extend(fts_columns.clone());
+                }
+                SelectColumn::Expr { expr, alias } => {
+                    if let Some(a) = alias {
+                        col_names.push(a.clone());
+                    } else if let Expr::Column { name, .. } = expr {
+                        col_names.push(name.clone());
+                    } else if let Expr::Function { name, .. } = expr {
+                        col_names.push(name.to_lowercase());
+                    } else {
+                        col_names.push(format!("{:?}", expr));
+                    }
+                }
+            }
+        }
+    }
+
+    // Build row data
+    for (rowid, doc_values, bm25_score) in &rows_data {
+        if is_star {
+            let mut row = doc_values.clone();
+            row.push(Value::Real(*bm25_score));
+            rows.push(row);
+        } else {
+            let mut row = Vec::new();
+            for sc in &select.columns {
+                match sc {
+                    SelectColumn::AllColumns => {
+                        row.extend(doc_values.clone());
+                        row.push(Value::Real(*bm25_score));
+                    }
+                    SelectColumn::TableAllColumns(_) => {
+                        row.extend(doc_values.clone());
+                    }
+                    SelectColumn::Expr { expr, .. } => {
+                        let val = eval_fts5_expr(
+                            expr,
+                            table_name,
+                            *rowid,
+                            doc_values,
+                            &fts_columns,
+                            *bm25_score,
+                            &query_for_fns,
+                        )?;
+                        row.push(val);
+                    }
+                }
+            }
+            rows.push(row);
+        }
+    }
+
+    // Apply ORDER BY
+    if !select.order_by.is_empty() {
+        sort_rows_dynamic(&mut rows, &select.order_by, &col_names)?;
+    }
+
+    // Apply DISTINCT
+    if select.distinct {
+        let mut seen: Vec<Vec<Value>> = Vec::new();
+        let mut unique = Vec::new();
+        for row in rows {
+            if !seen.contains(&row) {
+                seen.push(row.clone());
+                unique.push(row);
+            }
+        }
+        rows = unique;
+    }
+
+    // Apply OFFSET
+    if let Some(ref offset_expr) = select.offset {
+        let offset = eval_const_expr(offset_expr).as_integer().unwrap_or(0) as usize;
+        if offset < rows.len() {
+            rows = rows.into_iter().skip(offset).collect();
+        } else {
+            rows.clear();
+        }
+    }
+
+    // Apply LIMIT
+    if let Some(ref limit_expr) = select.limit {
+        let limit = eval_const_expr(limit_expr).as_integer().unwrap_or(i64::MAX) as usize;
+        rows.truncate(limit);
+    }
+
+    Ok((col_names, rows))
+}
+
+/// Evaluate an expression in the context of an FTS5 row.
+fn eval_fts5_expr(
+    expr: &Expr,
+    table_name: &str,
+    rowid: i64,
+    doc_values: &[Value],
+    fts_columns: &[String],
+    bm25_score: f64,
+    query: &str,
+) -> Result<Value> {
+    match expr {
+        Expr::Column { name, .. } => {
+            if name.eq_ignore_ascii_case("rank") {
+                return Ok(Value::Real(bm25_score));
+            }
+            if name.eq_ignore_ascii_case("rowid") {
+                return Ok(Value::Integer(rowid));
+            }
+            // Look up by column name
+            if let Some(idx) = fts_columns.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+                Ok(doc_values.get(idx).cloned().unwrap_or(Value::Null))
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        Expr::Function { name, args, .. } => {
+            let upper = name.to_uppercase();
+            match upper.as_str() {
+                "HIGHLIGHT" => {
+                    // highlight(table, col_idx, before_tag, after_tag)
+                    if args.len() < 4 {
+                        return Err(HorizonError::InvalidSql(
+                            "highlight() requires 4 arguments".into(),
+                        ));
+                    }
+                    let col_idx = match &args[1] {
+                        Expr::Literal(LiteralValue::Integer(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    let before = match &args[2] {
+                        Expr::Literal(LiteralValue::String(s)) => s.clone(),
+                        _ => "<b>".to_string(),
+                    };
+                    let after = match &args[3] {
+                        Expr::Literal(LiteralValue::String(s)) => s.clone(),
+                        _ => "</b>".to_string(),
+                    };
+                    let result = fts5::fts5_highlight(table_name, rowid, col_idx, &before, &after, query)?;
+                    Ok(Value::Text(result))
+                }
+                "SNIPPET" => {
+                    // snippet(table, col_idx, before_tag, after_tag, ellipsis, max_tokens)
+                    if args.len() < 6 {
+                        return Err(HorizonError::InvalidSql(
+                            "snippet() requires 6 arguments".into(),
+                        ));
+                    }
+                    let col_idx = match &args[1] {
+                        Expr::Literal(LiteralValue::Integer(n)) => *n as usize,
+                        _ => 0,
+                    };
+                    let before = match &args[2] {
+                        Expr::Literal(LiteralValue::String(s)) => s.clone(),
+                        _ => "<b>".to_string(),
+                    };
+                    let after = match &args[3] {
+                        Expr::Literal(LiteralValue::String(s)) => s.clone(),
+                        _ => "</b>".to_string(),
+                    };
+                    let ellipsis = match &args[4] {
+                        Expr::Literal(LiteralValue::String(s)) => s.clone(),
+                        _ => "...".to_string(),
+                    };
+                    let max_tokens = match &args[5] {
+                        Expr::Literal(LiteralValue::Integer(n)) => *n as usize,
+                        _ => 10,
+                    };
+                    let result = fts5::fts5_snippet(
+                        table_name, rowid, col_idx, &before, &after, &ellipsis, max_tokens, query,
+                    )?;
+                    Ok(Value::Text(result))
+                }
+                "BM25" => {
+                    let score = fts5::fts5_bm25(table_name, rowid, query)?;
+                    Ok(Value::Real(score))
+                }
+                _ => {
+                    // For other functions, try to evaluate with dynamic context
+                    let col_names: Vec<String> = fts_columns.to_vec();
+                    eval_function_dynamic(name, args, doc_values, &col_names)
+                }
+            }
+        }
+        Expr::Literal(lit) => Ok(literal_to_value(lit)),
+        Expr::BinaryOp { left, op, right } => {
+            let l = eval_fts5_expr(left, table_name, rowid, doc_values, fts_columns, bm25_score, query)?;
+            let r = eval_fts5_expr(right, table_name, rowid, doc_values, fts_columns, bm25_score, query)?;
+            Ok(eval_binary_op(&l, op, &r))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+// ---- FTS5 INSERT ----
+
+fn execute_fts5_insert(ins: &InsertStatement) -> Result<usize> {
+    let columns = fts5::fts5_get_columns(&ins.table)?;
+    let mut inserted = 0;
+
+    for value_row in &ins.values {
+        // Evaluate expressions to get values
+        let dummy_table = TableInfo {
+            name: ins.table.clone(),
+            columns: vec![],
+            root_page: 0,
+            next_rowid: 0,
+            pk_column: None,
+        };
+
+        let mut col_values: Vec<String> = Vec::new();
+
+        if let Some(ref col_names) = ins.columns {
+            // Named columns: map values to column positions
+            let mut vals = vec![String::new(); columns.len()];
+            for (i, col_name) in col_names.iter().enumerate() {
+                if let Some(pos) = columns.iter().position(|c| c.eq_ignore_ascii_case(col_name)) {
+                    let val = eval_expr(&value_row[i], &[], &[], &dummy_table)?;
+                    vals[pos] = match val {
+                        Value::Text(s) => s,
+                        Value::Null => String::new(),
+                        other => format!("{}", other),
+                    };
+                } else {
+                    return Err(HorizonError::ColumnNotFound(format!(
+                        "{}.{}",
+                        ins.table, col_name
+                    )));
+                }
+            }
+            col_values = vals;
+        } else {
+            // Positional: assign values to columns in order
+            for expr in value_row {
+                let val = eval_expr(expr, &[], &[], &dummy_table)?;
+                col_values.push(match val {
+                    Value::Text(s) => s,
+                    Value::Null => String::new(),
+                    other => format!("{}", other),
+                });
+            }
+            // Pad with empty strings if fewer values than columns
+            while col_values.len() < columns.len() {
+                col_values.push(String::new());
+            }
+        }
+
+        fts5::fts5_insert(&ins.table, col_values)?;
+        inserted += 1;
+    }
+
+    Ok(inserted)
+}
+
 // ---- INSERT ----
 
 fn execute_insert(
@@ -239,6 +611,11 @@ fn execute_insert(
     catalog: &mut Catalog,
     txn_mgr: &mut TransactionManager,
 ) -> Result<usize> {
+    // Check if this is an FTS5 virtual table
+    if fts5::fts5_table_exists(&ins.table) {
+        return execute_fts5_insert(ins);
+    }
+
     let table = catalog.get_table(&ins.table)?.clone();
     let mut tree = BTree::open(table.root_page);
     let mut next_rowid = table.next_rowid;
@@ -620,10 +997,18 @@ fn execute_select_body_inner(
         let rows = result.rows.into_iter().map(|r| r.values).collect();
         return Ok((col_names, rows));
     }
+    // Handle FTS5 table function syntax: FROM table('query')
+    if let Some(FromClause::TableFunction { name, args, .. }) = &select.from {
+        if fts5::fts5_table_exists(name) {
+            return execute_fts5_select(select, name, Some(args), pool, catalog);
+        }
+    }
+
     let (table_name, _alias) = match &select.from {
         Some(FromClause::Table { name, alias }) => (name.clone(), alias.clone()),
         Some(FromClause::Join { .. }) => { unreachable!(); }
         Some(FromClause::Subquery { .. }) => { return Err(HorizonError::NotImplemented("subqueries in FROM".into())); }
+        Some(FromClause::TableFunction { .. }) => { return Err(HorizonError::NotImplemented("table functions in FROM".into())); }
         None => {
             let result = execute_select_no_from(select)?;
             let col_names = result.columns.as_ref().clone();
@@ -631,6 +1016,17 @@ fn execute_select_body_inner(
             return Ok((col_names, rows));
         }
     };
+    // Check if this is an FTS5 virtual table
+    if fts5::fts5_table_exists(&table_name) {
+        return execute_fts5_select(select, &table_name, None, pool, catalog);
+    }
+    // Check if this is an R-tree virtual table
+    if catalog.rtree_exists(&table_name) {
+        let result = rtree::execute_rtree_select(select, pool, catalog)?;
+        let col_names = result.columns.as_ref().clone();
+        let rows = result.rows.into_iter().map(|r| r.values).collect();
+        return Ok((col_names, rows));
+    }
     // Check if this is a view and expand it
     if !catalog.table_exists(&table_name) {
         if let Some(view) = catalog.get_view(&table_name).cloned() {
@@ -759,7 +1155,7 @@ fn from_contains_cte(from: &FromClause, cte_store: &CteStore) -> bool {
     match from {
         FromClause::Table { name, .. } => cte_store.contains_key(&name.to_lowercase()),
         FromClause::Join { left, right, .. } => from_contains_cte(left, cte_store) || from_contains_cte(right, cte_store),
-        FromClause::Subquery { .. } => false,
+        FromClause::Subquery { .. } | FromClause::TableFunction { .. } => false,
     }
 }
 
@@ -923,6 +1319,7 @@ fn execute_from_with_ctes(from: &FromClause, pool: &mut BufferPool, catalog: &mu
             Ok((merged_cols, result))
         }
         FromClause::Subquery { .. } => Err(HorizonError::NotImplemented("subquery in FROM with CTEs".into())),
+        FromClause::TableFunction { .. } => Err(HorizonError::NotImplemented("table function in FROM with CTEs".into())),
     }
 }
 
@@ -1028,6 +1425,7 @@ fn execute_select_with_window_functions(
         Some(FromClause::Table { name, alias }) => (name.clone(), alias.clone()),
         Some(FromClause::Join { .. }) => return Err(HorizonError::NotImplemented("window functions with JOINs".into())),
         Some(FromClause::Subquery { .. }) => return Err(HorizonError::NotImplemented("window functions with subqueries".into())),
+        Some(FromClause::TableFunction { .. }) => return Err(HorizonError::NotImplemented("window functions with table functions".into())),
         None => return Err(HorizonError::InvalidSql("window functions require a FROM clause".into())),
     };
     let table = catalog.get_table(&table_name)?.clone();
@@ -1758,6 +2156,12 @@ fn eval_expr_dynamic(
         Expr::Collate { expr: inner, .. } => {
             // Evaluate the inner expression, ignoring collation for now
             eval_expr_dynamic(inner, row, col_names)
+        }
+        Expr::Match { .. } => {
+            // MATCH expressions are handled at the FTS5 query level, not per-row in dynamic context.
+            // If we reach here, it means we're evaluating it outside FTS context - return true
+            // so it doesn't filter rows that have already been matched.
+            Ok(Value::Integer(1))
         }
     }
 }
@@ -3458,12 +3862,85 @@ fn execute_update(
 
 // ---- DELETE ----
 
+/// Extract the search query string from a MATCH expression like:
+/// `table_name MATCH 'query'`
+fn extract_fts5_match_query(expr: &Expr, table_name: &str) -> Option<String> {
+    match expr {
+        Expr::Match { table, pattern } => {
+            // table should be a column reference to the table name
+            if let Expr::Column { name, .. } = table.as_ref() {
+                if name.eq_ignore_ascii_case(table_name) {
+                    if let Expr::Literal(LiteralValue::String(s)) = pattern.as_ref() {
+                        return Some(s.clone());
+                    }
+                }
+            }
+            None
+        }
+        Expr::BinaryOp { left, op: BinaryOp::And, right } => {
+            // Check both sides for MATCH
+            extract_fts5_match_query(left, table_name)
+                .or_else(|| extract_fts5_match_query(right, table_name))
+        }
+        _ => None,
+    }
+}
+
+/// Extract rowid from a `rowid = N` expression.
+fn extract_rowid_eq(expr: &Expr) -> Option<i64> {
+    if let Expr::BinaryOp { left, op: BinaryOp::Eq, right } = expr {
+        if let Expr::Column { name, .. } = left.as_ref() {
+            if name.eq_ignore_ascii_case("rowid") {
+                if let Expr::Literal(LiteralValue::Integer(n)) = right.as_ref() {
+                    return Some(*n);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn execute_fts5_delete(del: &DeleteStatement) -> Result<usize> {
+    if let Some(ref where_clause) = del.where_clause {
+        // Check for MATCH expression in WHERE clause
+        if let Some(query_text) = extract_fts5_match_query(where_clause, &del.table) {
+            return fts5::fts5_delete_matching(&del.table, &query_text);
+        }
+        // Check for rowid = N
+        if let Some(rowid) = extract_rowid_eq(where_clause) {
+            let deleted = fts5::fts5_delete(&del.table, rowid)?;
+            return Ok(if deleted { 1 } else { 0 });
+        }
+        // For other WHERE clauses, do a scan and filter
+        let all_rows = fts5::fts5_scan_all(&del.table)?;
+        let columns = fts5::fts5_get_columns(&del.table)?;
+        let mut deleted = 0;
+        for (rowid, values) in &all_rows {
+            // Evaluate the WHERE clause using dynamic evaluation
+            let col_names: Vec<String> = columns.clone();
+            if eval_expr_dynamic(where_clause, values, &col_names)?.to_bool() {
+                fts5::fts5_delete(&del.table, *rowid)?;
+                deleted += 1;
+            }
+        }
+        Ok(deleted)
+    } else {
+        // DELETE all
+        fts5::fts5_delete_all(&del.table)
+    }
+}
+
 fn execute_delete(
     del: &DeleteStatement,
     pool: &mut BufferPool,
     catalog: &mut Catalog,
     txn_mgr: &mut TransactionManager,
 ) -> Result<usize> {
+    // Check if this is an FTS5 virtual table
+    if fts5::fts5_table_exists(&del.table) {
+        return execute_fts5_delete(del);
+    }
+
     // Fire BEFORE DELETE triggers
     views_triggers::fire_triggers(&del.table, &TriggerEventKind::Delete, &TriggerTimingKind::Before, pool, catalog, txn_mgr)?;
 
@@ -3944,6 +4421,28 @@ fn execute_pragma(pragma: &PragmaStatement, pool: &mut BufferPool, catalog: &mut
             }
             Ok(QueryResult { columns, rows })
         }
+        "table_list" => {
+            let columns = Arc::new(vec![
+                "schema".into(), "name".into(), "type".into(),
+                "ncol".into(), "wr".into(), "strict".into(),
+            ]);
+            let mut rows = Vec::new();
+            let mut table_names = catalog.list_tables();
+            table_names.sort();
+            for tname in table_names {
+                let table = catalog.get_table(tname)?;
+                let ncol = table.columns.len() as i64;
+                rows.push(Row { columns: columns.clone(), values: vec![
+                    Value::Text("main".into()),
+                    Value::Text(tname.to_string()),
+                    Value::Text("table".into()),
+                    Value::Integer(ncol),
+                    Value::Integer(0),
+                    Value::Integer(0),
+                ]});
+            }
+            Ok(QueryResult { columns, rows })
+        }
         "index_list" => {
             let table_name = pragma_extract_table_name(pragma)?;
             let _ = catalog.get_table(&table_name)?;
@@ -3954,6 +4453,20 @@ fn execute_pragma(pragma: &PragmaStatement, pool: &mut BufferPool, catalog: &mut
                 rows.push(Row { columns: columns.clone(), values: vec![
                     Value::Integer(i as i64), Value::Text(idx.name.clone()),
                     Value::Integer(if idx.unique { 1 } else { 0 }), Value::Text("c".into()), Value::Integer(0),
+                ]});
+            }
+            Ok(QueryResult { columns, rows })
+        }
+        "index_info" => {
+            let index_name = pragma_extract_table_name(pragma)?;
+            let index = catalog.get_index(&index_name)?;
+            let table = catalog.get_table(&index.table_name)?;
+            let columns = Arc::new(vec!["seqno".into(), "cid".into(), "name".into()]);
+            let mut rows = Vec::new();
+            for (i, col_name) in index.columns.iter().enumerate() {
+                let cid = table.find_column_index(col_name).unwrap_or(0) as i64;
+                rows.push(Row { columns: columns.clone(), values: vec![
+                    Value::Integer(i as i64), Value::Integer(cid), Value::Text(col_name.clone()),
                 ]});
             }
             Ok(QueryResult { columns, rows })
@@ -3971,6 +4484,14 @@ fn execute_pragma(pragma: &PragmaStatement, pool: &mut BufferPool, catalog: &mut
             let count = pool.pager().page_count();
             let columns = Arc::new(vec!["page_count".into()]);
             Ok(QueryResult { columns: columns.clone(), rows: vec![Row { columns, values: vec![Value::Integer(count as i64)] }] })
+        }
+        "journal_mode" => {
+            let columns = Arc::new(vec!["journal_mode".into()]);
+            Ok(QueryResult { columns: columns.clone(), rows: vec![Row { columns, values: vec![Value::Text("wal".into())] }] })
+        }
+        "encoding" => {
+            let columns = Arc::new(vec!["encoding".into()]);
+            Ok(QueryResult { columns: columns.clone(), rows: vec![Row { columns, values: vec![Value::Text("UTF-8".into())] }] })
         }
         _ => {
             let columns = Arc::new(vec![pragma.name.clone()]);
@@ -3991,12 +4512,291 @@ fn pragma_extract_table_name(pragma: &PragmaStatement) -> Result<String> {
 
 fn execute_explain(inner_stmt: &Statement, catalog: &Catalog) -> Result<QueryResult> {
     let plan = plan_statement(inner_stmt, catalog)?;
-    let detail = format_plan(&plan, 0);
-    let columns = Arc::new(vec!["detail".to_string()]);
-    let rows = detail.lines().map(|line| Row { columns: columns.clone(), values: vec![Value::Text(line.to_string())] }).collect();
+    let columns = Arc::new(vec![
+        "addr".to_string(), "opcode".to_string(),
+        "p1".to_string(), "p2".to_string(), "p3".to_string(), "p4".to_string(),
+    ]);
+    let mut rows = Vec::new();
+    let mut addr: i64 = 0;
+    explain_plan_opcodes(&plan, &columns, &mut rows, &mut addr);
     Ok(QueryResult { columns, rows })
 }
 
+/// Generate opcode-style rows for EXPLAIN output by walking the logical plan.
+fn explain_plan_opcodes(
+    plan: &LogicalPlan,
+    columns: &Arc<Vec<String>>,
+    rows: &mut Vec<Row>,
+    addr: &mut i64,
+) {
+    match plan {
+        LogicalPlan::SeqScan { table, alias } => {
+            let detail = alias.as_deref()
+                .map(|a| format!("{} AS {}", table, a))
+                .unwrap_or_else(|| table.clone());
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("OpenRead".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(detail),
+            ] });
+            *addr += 1;
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Rewind".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(format!("table {}", table)),
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            explain_plan_opcodes(input, columns, rows, addr);
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Filter".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(format!("{:?}", predicate)),
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Project { input, .. } => {
+            explain_plan_opcodes(input, columns, rows, addr);
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Column".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("ResultRow".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Sort { input, .. } => {
+            explain_plan_opcodes(input, columns, rows, addr);
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("SorterOpen".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("SorterSort".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Limit { input, .. } => {
+            explain_plan_opcodes(input, columns, rows, addr);
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Limit".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Aggregate { input, .. } => {
+            explain_plan_opcodes(input, columns, rows, addr);
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("AggStep".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("AggFinal".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Join { left, right, join_type, .. } => {
+            explain_plan_opcodes(left, columns, rows, addr);
+            explain_plan_opcodes(right, columns, rows, addr);
+            let jt = match join_type {
+                JoinType::Inner => "INNER JOIN",
+                JoinType::Left => "LEFT JOIN",
+                JoinType::Right => "RIGHT JOIN",
+                JoinType::Cross => "CROSS JOIN",
+            };
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Join".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(jt.into()),
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Distinct { input } => {
+            explain_plan_opcodes(input, columns, rows, addr);
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Distinct".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Insert { table, .. } => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Insert".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(table.clone()),
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Update { table, .. } => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Update".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(table.clone()),
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Delete { table, .. } => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Delete".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(table.clone()),
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::CreateTable(ct) => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("CreateTable".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(ct.name.clone()),
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::DropTable(dt) => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("DropTable".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(dt.name.clone()),
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::CreateIndex(ci) => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("CreateIndex".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(format!("{} ON {}", ci.name, ci.table)),
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::DropIndex(di) => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("DropIndex".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Text(di.name.clone()),
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Begin => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("AutoCommit".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Commit | LogicalPlan::Rollback => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Halt".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+        }
+        LogicalPlan::Empty => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(*addr), Value::Text("Init".into()),
+                Value::Integer(0), Value::Integer(0), Value::Integer(0), Value::Null,
+            ] });
+            *addr += 1;
+        }
+    }
+    // Always add a Halt row at the end if we're at the top level (addr == total)
+}
+
+fn execute_explain_query_plan(inner_stmt: &Statement, catalog: &Catalog) -> Result<QueryResult> {
+    let plan = plan_statement(inner_stmt, catalog)?;
+    let columns = Arc::new(vec![
+        "selectid".to_string(), "order".to_string(), "from".to_string(), "detail".to_string(),
+    ]);
+    let mut rows = Vec::new();
+    let mut order: i64 = 0;
+    eqp_walk(&plan, &columns, &mut rows, 0, &mut order);
+    Ok(QueryResult { columns, rows })
+}
+
+/// Walk the logical plan tree and produce EXPLAIN QUERY PLAN rows.
+fn eqp_walk(
+    plan: &LogicalPlan,
+    columns: &Arc<Vec<String>>,
+    rows: &mut Vec<Row>,
+    selectid: i64,
+    order: &mut i64,
+) {
+    match plan {
+        LogicalPlan::SeqScan { table, alias } => {
+            let detail = if let Some(a) = alias {
+                format!("SCAN TABLE {} AS {}", table, a)
+            } else {
+                format!("SCAN TABLE {}", table)
+            };
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(selectid), Value::Integer(*order),
+                Value::Integer(0), Value::Text(detail),
+            ] });
+            *order += 1;
+        }
+        LogicalPlan::Filter { input, .. } => {
+            eqp_walk(input, columns, rows, selectid, order);
+        }
+        LogicalPlan::Project { input, .. } => {
+            eqp_walk(input, columns, rows, selectid, order);
+        }
+        LogicalPlan::Sort { input, .. } => {
+            eqp_walk(input, columns, rows, selectid, order);
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(selectid), Value::Integer(*order),
+                Value::Integer(0), Value::Text("USE TEMP B-TREE FOR ORDER BY".into()),
+            ] });
+            *order += 1;
+        }
+        LogicalPlan::Limit { input, .. } => {
+            eqp_walk(input, columns, rows, selectid, order);
+        }
+        LogicalPlan::Aggregate { input, group_by, .. } => {
+            eqp_walk(input, columns, rows, selectid, order);
+            if !group_by.is_empty() {
+                rows.push(Row { columns: columns.clone(), values: vec![
+                    Value::Integer(selectid), Value::Integer(*order),
+                    Value::Integer(0), Value::Text("USE TEMP B-TREE FOR GROUP BY".into()),
+                ] });
+                *order += 1;
+            }
+        }
+        LogicalPlan::Join { left, right, join_type, .. } => {
+            eqp_walk(left, columns, rows, selectid, order);
+            eqp_walk(right, columns, rows, selectid, order);
+            let _ = join_type; // join type is reflected in scan details
+        }
+        LogicalPlan::Distinct { input } => {
+            eqp_walk(input, columns, rows, selectid, order);
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(selectid), Value::Integer(*order),
+                Value::Integer(0), Value::Text("USE TEMP B-TREE FOR DISTINCT".into()),
+            ] });
+            *order += 1;
+        }
+        LogicalPlan::Insert { table, .. } => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(selectid), Value::Integer(*order),
+                Value::Integer(0), Value::Text(format!("SCAN TABLE {}", table)),
+            ] });
+            *order += 1;
+        }
+        LogicalPlan::Update { table, .. } => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(selectid), Value::Integer(*order),
+                Value::Integer(0), Value::Text(format!("SCAN TABLE {}", table)),
+            ] });
+            *order += 1;
+        }
+        LogicalPlan::Delete { table, .. } => {
+            rows.push(Row { columns: columns.clone(), values: vec![
+                Value::Integer(selectid), Value::Integer(*order),
+                Value::Integer(0), Value::Text(format!("SCAN TABLE {}", table)),
+            ] });
+            *order += 1;
+        }
+        _ => {
+            // DDL, Begin, Commit, Rollback, Empty -- no query plan detail
+        }
+    }
+}
+
+#[allow(dead_code)]
 fn format_plan(plan: &LogicalPlan, indent: usize) -> String {
     let pfx = "  ".repeat(indent);
     match plan {
@@ -4421,6 +5221,11 @@ fn eval_expr(
         Expr::Collate { expr: inner, .. } => {
             // Evaluate the inner expression, ignoring collation for now
             eval_expr(inner, row, columns, table)
+        }
+        Expr::Match { .. } => {
+            // MATCH expressions are handled at the FTS5 query level.
+            // If we reach here during row evaluation, the row was already matched.
+            Ok(Value::Integer(1))
         }
     }
 }

@@ -21,6 +21,7 @@ pub enum Statement {
     DropTrigger(DropTriggerStatement),
     AlterTable(AlterTableStatement),
     Explain(Box<Statement>),
+    ExplainQueryPlan(Box<Statement>),
     Pragma(PragmaStatement),
     Begin,
     Commit,
@@ -28,6 +29,7 @@ pub enum Statement {
     AttachDatabase(AttachDatabaseStatement),
     DetachDatabase(DetachDatabaseStatement),
     Vacuum,
+    CreateVirtualTable(CreateVirtualTableStatement),
 }
 
 /// A `SELECT` statement, possibly with CTEs and compound operators.
@@ -110,6 +112,12 @@ pub enum FromClause {
     Subquery {
         query: Box<SelectStatement>,
         alias: String,
+    },
+    /// A table-valued function call: `fts_table('search terms')`.
+    TableFunction {
+        name: String,
+        args: Vec<Expr>,
+        alias: Option<String>,
     },
 }
 
@@ -306,6 +314,15 @@ pub struct DetachDatabaseStatement {
     pub schema_name: String,
 }
 
+/// A `CREATE VIRTUAL TABLE ... USING module(args)` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateVirtualTableStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub module_name: String,
+    pub module_args: Vec<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
@@ -346,6 +363,11 @@ pub enum Expr {
         expr: Box<Expr>,
         pattern: Box<Expr>,
         negated: bool,
+    },
+    /// A `MATCH` expression: `table_name MATCH 'search terms'`.
+    Match {
+        table: Box<Expr>,
+        pattern: Box<Expr>,
     },
     Function {
         name: String,
