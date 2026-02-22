@@ -1905,3 +1905,1149 @@ fn explain_create_table() {
     let all_text: String = result.rows.iter().map(|r| r.values[0].as_text().unwrap().to_string()).collect::<Vec<_>>().join("\n");
     assert!(all_text.contains("CREATE TABLE t"));
 }
+
+// ====================================================================
+// JSON functions
+// ====================================================================
+
+#[test]
+fn json_extract_simple_key() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE jdata (id INTEGER PRIMARY KEY, doc TEXT)").unwrap();
+    db.execute(r#"INSERT INTO jdata VALUES (1, '{"name":"Alice","age":30}')"#).unwrap();
+
+    let result = db.query("SELECT JSON_EXTRACT(doc, '$.name') FROM jdata").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Text("Alice".to_string()));
+}
+
+#[test]
+fn json_extract_nested_path() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE jdata (id INTEGER PRIMARY KEY, doc TEXT)").unwrap();
+    db.execute(r#"INSERT INTO jdata VALUES (1, '{"a":{"b":{"c":42}}}')"#).unwrap();
+
+    let result = db.query("SELECT JSON_EXTRACT(doc, '$.a.b.c') FROM jdata").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Integer(42));
+}
+
+#[test]
+fn json_extract_array_index() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE jdata (id INTEGER PRIMARY KEY, doc TEXT)").unwrap();
+    db.execute(r#"INSERT INTO jdata VALUES (1, '{"items":[10,20,30]}')"#).unwrap();
+
+    let result = db.query("SELECT JSON_EXTRACT(doc, '$.items[1]') FROM jdata").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Integer(20));
+}
+
+#[test]
+fn json_extract_missing_path_returns_null() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE jdata (id INTEGER PRIMARY KEY, doc TEXT)").unwrap();
+    db.execute(r#"INSERT INTO jdata VALUES (1, '{"name":"Alice"}')"#).unwrap();
+
+    let result = db.query("SELECT JSON_EXTRACT(doc, '$.missing') FROM jdata").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Null);
+}
+
+#[test]
+fn json_array_construction() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT JSON_ARRAY(1, 'hello', NULL)").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result.rows[0].values[0],
+        Value::Text("[1,\"hello\",null]".to_string())
+    );
+}
+
+#[test]
+fn json_object_construction() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT JSON_OBJECT('name', 'Alice', 'age', 30)").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result.rows[0].values[0],
+        Value::Text("{\"name\":\"Alice\",\"age\":30}".to_string())
+    );
+}
+
+#[test]
+fn json_valid_true() {
+    let (_dir, db) = open_db();
+    let result = db.query(r#"SELECT JSON_VALID('{"key":"value"}')"#).unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(1));
+}
+
+#[test]
+fn json_valid_false() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT JSON_VALID('{invalid}')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(0));
+}
+
+#[test]
+fn json_valid_array() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT JSON_VALID('[1, 2, 3]')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(1));
+}
+
+#[test]
+fn json_type_basic() {
+    let (_dir, db) = open_db();
+
+    let result = db.query(r#"SELECT JSON_TYPE('{"a":1}')"#).unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("object".to_string()));
+
+    let result = db.query("SELECT JSON_TYPE('[1,2,3]')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("array".to_string()));
+
+    let result = db.query("SELECT JSON_TYPE('42')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("integer".to_string()));
+
+    let result = db.query("SELECT JSON_TYPE('3.14')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("real".to_string()));
+
+    let result = db.query(r#"SELECT JSON_TYPE('"hello"')"#).unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("text".to_string()));
+
+    let result = db.query("SELECT JSON_TYPE('null')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("null".to_string()));
+
+    let result = db.query("SELECT JSON_TYPE('true')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("true".to_string()));
+
+    let result = db.query("SELECT JSON_TYPE('false')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("false".to_string()));
+}
+
+#[test]
+fn json_type_with_path() {
+    let (_dir, db) = open_db();
+    let result = db.query(r#"SELECT JSON_TYPE('{"a":42,"b":"hi"}', '$.a')"#).unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("integer".to_string()));
+
+    let result = db.query(r#"SELECT JSON_TYPE('{"a":42,"b":"hi"}', '$.b')"#).unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("text".to_string()));
+}
+
+#[test]
+fn json_array_length_basic() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT JSON_ARRAY_LENGTH('[1, 2, 3, 4, 5]')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(5));
+}
+
+#[test]
+fn json_array_length_empty() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT JSON_ARRAY_LENGTH('[]')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(0));
+}
+
+#[test]
+fn json_array_length_not_array() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT JSON_ARRAY_LENGTH('42')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Null);
+}
+
+#[test]
+fn json_array_length_with_path() {
+    let (_dir, db) = open_db();
+    let result = db.query(r#"SELECT JSON_ARRAY_LENGTH('{"items":[1,2,3]}', '$.items')"#).unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(3));
+}
+
+#[test]
+fn json_minify() {
+    let (_dir, db) = open_db();
+    let result = db.query(r#"SELECT JSON('  { "name" : "Alice" , "age" : 30 }  ')"#).unwrap();
+    assert_eq!(
+        result.rows[0].values[0],
+        Value::Text("{\"name\":\"Alice\",\"age\":30}".to_string())
+    );
+}
+
+// ====================================================================
+// RETURNING clause
+// ====================================================================
+
+#[test]
+fn returning_insert_all_columns() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL)").unwrap();
+
+    let result = db.query("INSERT INTO items VALUES (1, 'Apple', 1.50) RETURNING *").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.columns.len(), 3);
+    assert_eq!(result.rows[0].values[0], Value::Integer(1));
+    assert_eq!(result.rows[0].values[1], Value::Text("Apple".to_string()));
+    assert_eq!(result.rows[0].values[2], Value::Real(1.5));
+}
+
+#[test]
+fn returning_insert_specific_columns() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL)").unwrap();
+
+    let result = db.query("INSERT INTO items VALUES (1, 'Apple', 1.50) RETURNING id, name").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.columns.len(), 2);
+    assert_eq!(result.columns[0], "id");
+    assert_eq!(result.columns[1], "name");
+    assert_eq!(result.rows[0].values[0], Value::Integer(1));
+    assert_eq!(result.rows[0].values[1], Value::Text("Apple".to_string()));
+}
+
+#[test]
+fn returning_insert_multiple_rows() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+
+    let result = db.query("INSERT INTO items VALUES (1, 'Apple'), (2, 'Banana') RETURNING *").unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.rows[0].values[1], Value::Text("Apple".to_string()));
+    assert_eq!(result.rows[1].values[1], Value::Text("Banana".to_string()));
+}
+
+#[test]
+fn returning_update() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL)").unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'Apple', 1.50)").unwrap();
+    db.execute("INSERT INTO items VALUES (2, 'Banana', 0.75)").unwrap();
+
+    let result = db.query("UPDATE items SET price = price * 2 WHERE id = 1 RETURNING id, price").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Integer(1));
+    assert_eq!(result.rows[0].values[1], Value::Real(3.0));
+}
+
+#[test]
+fn returning_update_all() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price REAL)").unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'Apple', 1.50)").unwrap();
+    db.execute("INSERT INTO items VALUES (2, 'Banana', 0.75)").unwrap();
+
+    let result = db.query("UPDATE items SET price = 0 RETURNING *").unwrap();
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn returning_delete() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'Apple')").unwrap();
+    db.execute("INSERT INTO items VALUES (2, 'Banana')").unwrap();
+    db.execute("INSERT INTO items VALUES (3, 'Cherry')").unwrap();
+
+    let result = db.query("DELETE FROM items WHERE id > 1 RETURNING *").unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.rows[0].values[1], Value::Text("Banana".to_string()));
+    assert_eq!(result.rows[1].values[1], Value::Text("Cherry".to_string()));
+
+    // Verify the rows are actually deleted
+    let remaining = db.query("SELECT * FROM items").unwrap();
+    assert_eq!(remaining.len(), 1);
+}
+
+#[test]
+fn returning_delete_all() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'Apple')").unwrap();
+    db.execute("INSERT INTO items VALUES (2, 'Banana')").unwrap();
+
+    let result = db.query("DELETE FROM items RETURNING id").unwrap();
+    assert_eq!(result.len(), 2);
+}
+
+// ====================================================================
+// GROUP_CONCAT aggregate function
+// ====================================================================
+
+#[test]
+fn group_concat_basic() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE tags (id INTEGER PRIMARY KEY, category TEXT, tag TEXT)").unwrap();
+    db.execute("INSERT INTO tags VALUES (1, 'fruit', 'apple')").unwrap();
+    db.execute("INSERT INTO tags VALUES (2, 'fruit', 'banana')").unwrap();
+    db.execute("INSERT INTO tags VALUES (3, 'veg', 'carrot')").unwrap();
+
+    let result = db.query("SELECT category, GROUP_CONCAT(tag) FROM tags GROUP BY category").unwrap();
+    assert_eq!(result.len(), 2);
+    // Results should be grouped: fruit has apple,banana; veg has carrot
+    for row in &result.rows {
+        let cat = row.values[0].as_text().unwrap();
+        let concat = row.values[1].as_text().unwrap();
+        match cat {
+            "fruit" => assert_eq!(concat, "apple,banana"),
+            "veg" => assert_eq!(concat, "carrot"),
+            _ => panic!("unexpected category: {}", cat),
+        }
+    }
+}
+
+#[test]
+fn group_concat_custom_separator() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'a')").unwrap();
+    db.execute("INSERT INTO items VALUES (2, 'b')").unwrap();
+    db.execute("INSERT INTO items VALUES (3, 'c')").unwrap();
+
+    let result = db.query("SELECT GROUP_CONCAT(name, ' | ') FROM items").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Text("a | b | c".to_string()));
+}
+
+#[test]
+fn group_concat_null_handling() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'a')").unwrap();
+    db.execute("INSERT INTO items VALUES (2, NULL)").unwrap();
+    db.execute("INSERT INTO items VALUES (3, 'c')").unwrap();
+
+    let result = db.query("SELECT GROUP_CONCAT(name) FROM items").unwrap();
+    assert_eq!(result.len(), 1);
+    // NULL values should be skipped
+    assert_eq!(result.rows[0].values[0], Value::Text("a,c".to_string()));
+}
+
+// ====================================================================
+// QUOTE and UNICODE/CHAR functions
+// ====================================================================
+
+#[test]
+fn quote_text() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT QUOTE('hello')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("'hello'".to_string()));
+}
+
+#[test]
+fn quote_integer() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT QUOTE(42)").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("42".to_string()));
+}
+
+#[test]
+fn quote_null() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT QUOTE(NULL)").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("NULL".to_string()));
+}
+
+#[test]
+fn quote_text_with_quotes() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT QUOTE('it''s')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("'it''s'".to_string()));
+}
+
+#[test]
+fn unicode_function() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT UNICODE('A')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(65));
+}
+
+#[test]
+fn unicode_multibyte() {
+    let (_dir, db) = open_db();
+    // Test with various ASCII characters
+    let result = db.query("SELECT UNICODE('Z')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(90));
+
+    let result = db.query("SELECT UNICODE('0')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(48));
+}
+
+#[test]
+fn char_function() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT CHAR(72, 101, 108, 108, 111)").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("Hello".to_string()));
+}
+
+#[test]
+fn char_unicode_roundtrip() {
+    let (_dir, db) = open_db();
+    // CHAR(65) should be 'A', UNICODE('A') should be 65
+    let result = db.query("SELECT CHAR(65)").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("A".to_string()));
+
+    let result = db.query("SELECT UNICODE(CHAR(65))").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(65));
+}
+
+// ====================================================================
+// JSON functions on table data
+// ====================================================================
+
+#[test]
+fn json_extract_from_table() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, data TEXT)").unwrap();
+    db.execute(r#"INSERT INTO docs VALUES (1, '{"name":"Alice","scores":[85,92,78]}')"#).unwrap();
+    db.execute(r#"INSERT INTO docs VALUES (2, '{"name":"Bob","scores":[90,88,95]}')"#).unwrap();
+
+    let result = db.query("SELECT JSON_EXTRACT(data, '$.name') FROM docs WHERE id = 2").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Text("Bob".to_string()));
+
+    let result = db.query("SELECT JSON_EXTRACT(data, '$.scores[0]') FROM docs WHERE id = 1").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Integer(85));
+}
+
+#[test]
+fn json_valid_on_column() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, data TEXT)").unwrap();
+    db.execute(r#"INSERT INTO docs VALUES (1, '{"valid":true}')"#).unwrap();
+    db.execute("INSERT INTO docs VALUES (2, 'not json')").unwrap();
+
+    let result = db.query("SELECT id, JSON_VALID(data) FROM docs").unwrap();
+    assert_eq!(result.len(), 2);
+    // Row with id=1 should have JSON_VALID=1, row with id=2 should have JSON_VALID=0
+    for row in &result.rows {
+        let id = row.values[0].as_integer().unwrap();
+        let valid = row.values[1].as_integer().unwrap();
+        match id {
+            1 => assert_eq!(valid, 1),
+            2 => assert_eq!(valid, 0),
+            _ => panic!("unexpected id"),
+        }
+    }
+}
+
+#[test]
+fn json_array_length_from_table() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE docs (id INTEGER PRIMARY KEY, data TEXT)").unwrap();
+    db.execute(r#"INSERT INTO docs VALUES (1, '{"items":["a","b","c"]}')"#).unwrap();
+
+    let result = db.query("SELECT JSON_ARRAY_LENGTH(data, '$.items') FROM docs").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Integer(3));
+}
+
+// ====================================================================
+// PRINTF function
+// ====================================================================
+
+#[test]
+fn printf_basic() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT PRINTF('Hello %s, you are %d', 'World', 42)").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("Hello World, you are 42".to_string()));
+}
+
+#[test]
+fn printf_float() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT PRINTF('Pi is %f', 3.14159)").unwrap();
+    // The result should start with "Pi is 3.14159" (formatted with 6 decimal places)
+    let text = result.rows[0].values[0].as_text().unwrap();
+    assert!(text.starts_with("Pi is 3.14159"));
+}
+
+// ====================================================================
+// Window Functions
+// ====================================================================
+
+fn setup_window_test(db: &Database) {
+    db.execute(
+        "CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO employees VALUES (1, 'Alice',   'Engineering', 90000)").unwrap();
+    db.execute("INSERT INTO employees VALUES (2, 'Bob',     'Engineering', 85000)").unwrap();
+    db.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Engineering', 92000)").unwrap();
+    db.execute("INSERT INTO employees VALUES (4, 'Diana',   'Sales',      70000)").unwrap();
+    db.execute("INSERT INTO employees VALUES (5, 'Eve',     'Sales',      75000)").unwrap();
+    db.execute("INSERT INTO employees VALUES (6, 'Frank',   'Sales',      72000)").unwrap();
+}
+
+#[test]
+fn window_row_number_with_partition_and_order() {
+    let (_dir, db) = open_db();
+    setup_window_test(&db);
+
+    let result = db
+        .query("SELECT name, dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn FROM employees")
+        .unwrap();
+    assert_eq!(result.len(), 6);
+
+    // Collect results into a map: name -> rn
+    let mut name_rn = std::collections::HashMap::new();
+    for row in &result.rows {
+        let name = row.values[0].as_text().unwrap().to_string();
+        let rn = row.values[2].as_integer().unwrap();
+        name_rn.insert(name, rn);
+    }
+
+    // Engineering: Charlie(92000)=1, Alice(90000)=2, Bob(85000)=3
+    assert_eq!(name_rn["Charlie"], 1);
+    assert_eq!(name_rn["Alice"], 2);
+    assert_eq!(name_rn["Bob"], 3);
+
+    // Sales: Eve(75000)=1, Frank(72000)=2, Diana(70000)=3
+    assert_eq!(name_rn["Eve"], 1);
+    assert_eq!(name_rn["Frank"], 2);
+    assert_eq!(name_rn["Diana"], 3);
+}
+
+#[test]
+fn window_rank_and_dense_rank() {
+    let (_dir, db) = open_db();
+    db.execute(
+        "CREATE TABLE scores (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO scores VALUES (1, 'A', 100)").unwrap();
+    db.execute("INSERT INTO scores VALUES (2, 'B', 95)").unwrap();
+    db.execute("INSERT INTO scores VALUES (3, 'C', 100)").unwrap();
+    db.execute("INSERT INTO scores VALUES (4, 'D', 90)").unwrap();
+    db.execute("INSERT INTO scores VALUES (5, 'E', 95)").unwrap();
+
+    let result = db
+        .query(
+            "SELECT name, RANK() OVER (ORDER BY score DESC) AS rnk, \
+             DENSE_RANK() OVER (ORDER BY score DESC) AS drnk FROM scores",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 5);
+
+    let mut name_ranks = std::collections::HashMap::new();
+    for row in &result.rows {
+        let name = row.values[0].as_text().unwrap().to_string();
+        let rnk = row.values[1].as_integer().unwrap();
+        let drnk = row.values[2].as_integer().unwrap();
+        name_ranks.insert(name, (rnk, drnk));
+    }
+
+    // score=100: rank=1, dense_rank=1 (A and C tied)
+    assert_eq!(name_ranks["A"], (1, 1));
+    assert_eq!(name_ranks["C"], (1, 1));
+    // score=95: rank=3, dense_rank=2 (B and E tied, after 2 tied at rank 1)
+    assert_eq!(name_ranks["B"], (3, 2));
+    assert_eq!(name_ranks["E"], (3, 2));
+    // score=90: rank=5, dense_rank=3
+    assert_eq!(name_ranks["D"], (5, 3));
+}
+
+#[test]
+fn window_sum_running_total() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE ledger (id INTEGER PRIMARY KEY, amount INTEGER)").unwrap();
+    db.execute("INSERT INTO ledger VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO ledger VALUES (2, 20)").unwrap();
+    db.execute("INSERT INTO ledger VALUES (3, 30)").unwrap();
+    db.execute("INSERT INTO ledger VALUES (4, 40)").unwrap();
+
+    let result = db
+        .query("SELECT id, amount, SUM(amount) OVER (ORDER BY id) AS running FROM ledger")
+        .unwrap();
+    assert_eq!(result.len(), 4);
+
+    // Default frame: UNBOUNDED PRECEDING to CURRENT ROW => running total
+    let mut id_running = std::collections::HashMap::new();
+    for row in &result.rows {
+        let id = row.values[0].as_integer().unwrap();
+        let running = row.values[2].as_integer().unwrap();
+        id_running.insert(id, running);
+    }
+    assert_eq!(id_running[&1], 10);
+    assert_eq!(id_running[&2], 30);
+    assert_eq!(id_running[&3], 60);
+    assert_eq!(id_running[&4], 100);
+}
+
+#[test]
+fn window_lag_and_lead() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE seq (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO seq VALUES (1, 100)").unwrap();
+    db.execute("INSERT INTO seq VALUES (2, 200)").unwrap();
+    db.execute("INSERT INTO seq VALUES (3, 300)").unwrap();
+    db.execute("INSERT INTO seq VALUES (4, 400)").unwrap();
+
+    let result = db
+        .query(
+            "SELECT id, LAG(val, 1, 0) OVER (ORDER BY id) AS prev_val, \
+             LEAD(val, 1, 0) OVER (ORDER BY id) AS next_val FROM seq",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 4);
+
+    let mut id_vals = std::collections::HashMap::new();
+    for row in &result.rows {
+        let id = row.values[0].as_integer().unwrap();
+        let prev = row.values[1].as_integer().unwrap();
+        let next = row.values[2].as_integer().unwrap();
+        id_vals.insert(id, (prev, next));
+    }
+
+    assert_eq!(id_vals[&1], (0, 200));   // no previous, default=0
+    assert_eq!(id_vals[&2], (100, 300));
+    assert_eq!(id_vals[&3], (200, 400));
+    assert_eq!(id_vals[&4], (300, 0));   // no next, default=0
+}
+
+#[test]
+fn window_multiple_functions_same_query() {
+    let (_dir, db) = open_db();
+    setup_window_test(&db);
+
+    let result = db
+        .query(
+            "SELECT name, dept, \
+             ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC) AS rn, \
+             SUM(salary) OVER (PARTITION BY dept) AS dept_total, \
+             COUNT(*) OVER (PARTITION BY dept) AS dept_count \
+             FROM employees",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 6);
+
+    for row in &result.rows {
+        let dept = row.values[1].as_text().unwrap();
+        let dept_total = row.values[3].as_integer().unwrap();
+        let dept_count = row.values[4].as_integer().unwrap();
+
+        match dept {
+            "Engineering" => {
+                assert_eq!(dept_total, 90000 + 85000 + 92000); // 267000
+                assert_eq!(dept_count, 3);
+            }
+            "Sales" => {
+                assert_eq!(dept_total, 70000 + 75000 + 72000); // 217000
+                assert_eq!(dept_count, 3);
+            }
+            _ => panic!("unexpected dept: {}", dept),
+        }
+    }
+}
+
+#[test]
+fn window_count_star_over() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, cat TEXT)").unwrap();
+    db.execute("INSERT INTO items VALUES (1, 'A')").unwrap();
+    db.execute("INSERT INTO items VALUES (2, 'A')").unwrap();
+    db.execute("INSERT INTO items VALUES (3, 'B')").unwrap();
+    db.execute("INSERT INTO items VALUES (4, 'A')").unwrap();
+    db.execute("INSERT INTO items VALUES (5, 'B')").unwrap();
+
+    let result = db
+        .query("SELECT id, cat, COUNT(*) OVER (PARTITION BY cat) AS cat_count FROM items")
+        .unwrap();
+    assert_eq!(result.len(), 5);
+
+    for row in &result.rows {
+        let cat = row.values[1].as_text().unwrap();
+        let cat_count = row.values[2].as_integer().unwrap();
+        match cat {
+            "A" => assert_eq!(cat_count, 3),
+            "B" => assert_eq!(cat_count, 2),
+            _ => panic!("unexpected cat: {}", cat),
+        }
+    }
+}
+
+#[test]
+fn window_sum_with_explicit_frame() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE nums (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO nums VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO nums VALUES (2, 20)").unwrap();
+    db.execute("INSERT INTO nums VALUES (3, 30)").unwrap();
+    db.execute("INSERT INTO nums VALUES (4, 40)").unwrap();
+
+    // Explicit frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW (same as default)
+    let result = db
+        .query(
+            "SELECT id, SUM(val) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running FROM nums",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 4);
+
+    let mut id_running = std::collections::HashMap::new();
+    for row in &result.rows {
+        let id = row.values[0].as_integer().unwrap();
+        let running = row.values[1].as_integer().unwrap();
+        id_running.insert(id, running);
+    }
+    assert_eq!(id_running[&1], 10);
+    assert_eq!(id_running[&2], 30);
+    assert_eq!(id_running[&3], 60);
+    assert_eq!(id_running[&4], 100);
+}
+
+#[test]
+fn window_first_value_last_value() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE vals (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO vals VALUES (1, 100)").unwrap();
+    db.execute("INSERT INTO vals VALUES (2, 200)").unwrap();
+    db.execute("INSERT INTO vals VALUES (3, 300)").unwrap();
+
+    let result = db
+        .query(
+            "SELECT id, \
+             FIRST_VALUE(val) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS fv, \
+             LAST_VALUE(val) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv \
+             FROM vals",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 3);
+
+    for row in &result.rows {
+        let fv = row.values[1].as_integer().unwrap();
+        let lv = row.values[2].as_integer().unwrap();
+        // With UNBOUNDED...UNBOUNDED frame, first_value=100, last_value=300 for all rows
+        assert_eq!(fv, 100);
+        assert_eq!(lv, 300);
+    }
+}
+
+#[test]
+fn window_dense_rank_with_partition() {
+    let (_dir, db) = open_db();
+    setup_window_test(&db);
+
+    let result = db
+        .query(
+            "SELECT name, dept, DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC) AS dr FROM employees",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 6);
+
+    let mut name_dr = std::collections::HashMap::new();
+    for row in &result.rows {
+        let name = row.values[0].as_text().unwrap().to_string();
+        let dr = row.values[2].as_integer().unwrap();
+        name_dr.insert(name, dr);
+    }
+
+    // Engineering: Charlie(92000)=1, Alice(90000)=2, Bob(85000)=3
+    assert_eq!(name_dr["Charlie"], 1);
+    assert_eq!(name_dr["Alice"], 2);
+    assert_eq!(name_dr["Bob"], 3);
+
+    // Sales: Eve(75000)=1, Frank(72000)=2, Diana(70000)=3
+    assert_eq!(name_dr["Eve"], 1);
+    assert_eq!(name_dr["Frank"], 2);
+    assert_eq!(name_dr["Diana"], 3);
+}
+
+// ---------------------------------------------------------------------------
+// CTE (Common Table Expression) tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cte_simple() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+        .unwrap();
+    db.execute("INSERT INTO products VALUES (1, 'Apple', 1.50)").unwrap();
+    db.execute("INSERT INTO products VALUES (2, 'Banana', 0.75)").unwrap();
+    db.execute("INSERT INTO products VALUES (3, 'Cherry', 3.00)").unwrap();
+
+    let result = db
+        .query("WITH expensive AS (SELECT * FROM products WHERE price > 1.0) SELECT * FROM expensive")
+        .unwrap();
+    assert_eq!(result.len(), 2);
+
+    let mut names: Vec<String> = result
+        .rows
+        .iter()
+        .map(|r| r.values[1].as_text().unwrap().to_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Apple", "Cherry"]);
+}
+
+#[test]
+fn cte_with_alias_columns() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO items VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO items VALUES (2, 20)").unwrap();
+
+    let result = db
+        .query("WITH doubled(item_id, doubled_val) AS (SELECT id, val * 2 FROM items) SELECT * FROM doubled")
+        .unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.columns[0], "item_id");
+    assert_eq!(result.columns[1], "doubled_val");
+
+    let mut vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r.values[1].as_integer().unwrap())
+        .collect();
+    vals.sort();
+    assert_eq!(vals, vec![20, 40]);
+}
+
+#[test]
+fn cte_used_in_join() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, customer TEXT, amount REAL)")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (1, 'Alice', 50.0)").unwrap();
+    db.execute("INSERT INTO orders VALUES (2, 'Bob', 30.0)").unwrap();
+    db.execute("INSERT INTO orders VALUES (3, 'Alice', 20.0)").unwrap();
+
+    db.execute("CREATE TABLE customers (id INTEGER PRIMARY KEY, name TEXT, city TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO customers VALUES (1, 'Alice', 'NYC')").unwrap();
+    db.execute("INSERT INTO customers VALUES (2, 'Bob', 'LA')").unwrap();
+
+    let result = db
+        .query(
+            "WITH big_orders AS (SELECT * FROM orders WHERE amount >= 30.0) \
+             SELECT c.name, c.city, big_orders.amount \
+             FROM customers AS c \
+             INNER JOIN big_orders ON c.name = big_orders.customer",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 2);
+
+    let mut pairs: Vec<(String, f64)> = result
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                r.values[0].as_text().unwrap().to_string(),
+                r.values[2].as_real().unwrap(),
+            )
+        })
+        .collect();
+    pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    assert_eq!(pairs[0].0, "Bob");
+    assert!((pairs[0].1 - 30.0).abs() < 0.01);
+    assert_eq!(pairs[1].0, "Alice");
+    assert!((pairs[1].1 - 50.0).abs() < 0.01);
+}
+
+#[test]
+fn cte_recursive() {
+    let (_dir, db) = open_db();
+
+    let result = db
+        .query(
+            "WITH RECURSIVE cnt(x) AS ( \
+                 SELECT 1 \
+                 UNION ALL \
+                 SELECT x + 1 FROM cnt WHERE x < 10 \
+             ) SELECT x FROM cnt",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 10);
+
+    let vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_integer().unwrap())
+        .collect();
+    assert_eq!(vals, (1..=10).collect::<Vec<i64>>());
+}
+
+#[test]
+fn cte_recursive_fibonacci() {
+    let (_dir, db) = open_db();
+
+    let result = db
+        .query(
+            "WITH RECURSIVE fib(n, a, b) AS ( \
+                 SELECT 1, 0, 1 \
+                 UNION ALL \
+                 SELECT n + 1, b, a + b FROM fib WHERE n < 10 \
+             ) SELECT a FROM fib",
+        )
+        .unwrap();
+    assert_eq!(result.len(), 10);
+
+    let vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_integer().unwrap())
+        .collect();
+    // First 10 Fibonacci numbers: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34
+    assert_eq!(vals, vec![0, 1, 1, 2, 3, 5, 8, 13, 21, 34]);
+}
+
+// ---------------------------------------------------------------------------
+// Compound query tests (UNION / INTERSECT / EXCEPT)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn union_removes_duplicates() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (2, 20)").unwrap();
+
+    db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (3, 20)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (4, 30)").unwrap();
+
+    let result = db
+        .query("SELECT val FROM t1 UNION SELECT val FROM t2")
+        .unwrap();
+
+    let mut vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_integer().unwrap())
+        .collect();
+    vals.sort();
+    // 10, 20, 30 (20 is deduplicated)
+    assert_eq!(vals, vec![10, 20, 30]);
+}
+
+#[test]
+fn union_all_keeps_duplicates() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (2, 20)").unwrap();
+
+    db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (3, 20)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (4, 30)").unwrap();
+
+    let result = db
+        .query("SELECT val FROM t1 UNION ALL SELECT val FROM t2")
+        .unwrap();
+
+    let mut vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_integer().unwrap())
+        .collect();
+    vals.sort();
+    // 10, 20, 20, 30 (duplicates kept)
+    assert_eq!(vals, vec![10, 20, 20, 30]);
+}
+
+#[test]
+fn intersect_returns_common_rows() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (2, 20)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (3, 30)").unwrap();
+
+    db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (4, 20)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (5, 30)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (6, 40)").unwrap();
+
+    let result = db
+        .query("SELECT val FROM t1 INTERSECT SELECT val FROM t2")
+        .unwrap();
+
+    let mut vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_integer().unwrap())
+        .collect();
+    vals.sort();
+    // Only 20 and 30 are in both
+    assert_eq!(vals, vec![20, 30]);
+}
+
+#[test]
+fn except_returns_difference() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 10)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (2, 20)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (3, 30)").unwrap();
+
+    db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (4, 20)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (5, 40)").unwrap();
+
+    let result = db
+        .query("SELECT val FROM t1 EXCEPT SELECT val FROM t2")
+        .unwrap();
+
+    let mut vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_integer().unwrap())
+        .collect();
+    vals.sort();
+    // 10 and 30 are in t1 but not t2
+    assert_eq!(vals, vec![10, 30]);
+}
+
+#[test]
+fn union_with_order_by_and_limit() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 30)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (2, 10)").unwrap();
+
+    db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (3, 20)").unwrap();
+    db.execute("INSERT INTO t2 VALUES (4, 40)").unwrap();
+
+    let result = db
+        .query("SELECT val FROM t1 UNION ALL SELECT val FROM t2 ORDER BY val LIMIT 3")
+        .unwrap();
+
+    let vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_integer().unwrap())
+        .collect();
+    assert_eq!(vals, vec![10, 20, 30]);
+}
+
+#[test]
+fn union_literal_values() {
+    let (_dir, db) = open_db();
+
+    let result = db
+        .query("SELECT 1 AS x UNION SELECT 2 UNION SELECT 3")
+        .unwrap();
+
+    let mut vals: Vec<i64> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_integer().unwrap())
+        .collect();
+    vals.sort();
+    assert_eq!(vals, vec![1, 2, 3]);
+}
+
+// ---------------------------------------------------------------------------
+// IN-subquery tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn in_subquery_basic() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO departments VALUES (1, 'Engineering')").unwrap();
+    db.execute("INSERT INTO departments VALUES (2, 'Sales')").unwrap();
+
+    db.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept_id INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO employees VALUES (1, 'Alice', 1)").unwrap();
+    db.execute("INSERT INTO employees VALUES (2, 'Bob', 2)").unwrap();
+    db.execute("INSERT INTO employees VALUES (3, 'Charlie', 1)").unwrap();
+    db.execute("INSERT INTO employees VALUES (4, 'Diana', 3)").unwrap(); // dept 3 doesn't exist
+
+    let result = db
+        .query(
+            "SELECT name FROM employees WHERE dept_id IN (SELECT id FROM departments)",
+        )
+        .unwrap();
+
+    let mut names: Vec<String> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_text().unwrap().to_string())
+        .collect();
+    names.sort();
+    // Diana's dept_id=3 is not in departments, so she should be excluded
+    assert_eq!(names, vec!["Alice", "Bob", "Charlie"]);
+}
+
+#[test]
+fn not_in_subquery() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE allowed_ids (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO allowed_ids VALUES (1, 1)").unwrap();
+    db.execute("INSERT INTO allowed_ids VALUES (2, 3)").unwrap();
+
+    db.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+    db.execute("INSERT INTO data VALUES (1, 'A')").unwrap();
+    db.execute("INSERT INTO data VALUES (2, 'B')").unwrap();
+    db.execute("INSERT INTO data VALUES (3, 'C')").unwrap();
+    db.execute("INSERT INTO data VALUES (4, 'D')").unwrap();
+
+    let result = db
+        .query(
+            "SELECT label FROM data WHERE id NOT IN (SELECT val FROM allowed_ids)",
+        )
+        .unwrap();
+
+    let mut labels: Vec<String> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_text().unwrap().to_string())
+        .collect();
+    labels.sort();
+    // ids 1 and 3 are in allowed_ids, so B (id=2) and D (id=4) should be returned
+    assert_eq!(labels, vec!["B", "D"]);
+}
+
+#[test]
+fn in_subquery_empty_result() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE empty_table (id INTEGER PRIMARY KEY, val INTEGER)")
+        .unwrap();
+
+    db.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+    db.execute("INSERT INTO data VALUES (1, 'A')").unwrap();
+    db.execute("INSERT INTO data VALUES (2, 'B')").unwrap();
+
+    let result = db
+        .query(
+            "SELECT label FROM data WHERE id IN (SELECT val FROM empty_table)",
+        )
+        .unwrap();
+
+    // Subquery returns no rows, so no matches
+    assert_eq!(result.len(), 0);
+}
+
+#[test]
+fn in_subquery_with_where_in_subquery() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE categories (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO categories VALUES (1, 'Electronics', 1)").unwrap();
+    db.execute("INSERT INTO categories VALUES (2, 'Books', 0)").unwrap();
+    db.execute("INSERT INTO categories VALUES (3, 'Clothing', 1)").unwrap();
+
+    db.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, cat_id INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO products VALUES (1, 'Phone', 1)").unwrap();
+    db.execute("INSERT INTO products VALUES (2, 'Novel', 2)").unwrap();
+    db.execute("INSERT INTO products VALUES (3, 'Shirt', 3)").unwrap();
+    db.execute("INSERT INTO products VALUES (4, 'Laptop', 1)").unwrap();
+
+    let result = db
+        .query(
+            "SELECT name FROM products WHERE cat_id IN (SELECT id FROM categories WHERE active = 1)",
+        )
+        .unwrap();
+
+    let mut names: Vec<String> = result
+        .rows
+        .iter()
+        .map(|r| r.values[0].as_text().unwrap().to_string())
+        .collect();
+    names.sort();
+    // Active categories are 1 (Electronics) and 3 (Clothing)
+    assert_eq!(names, vec!["Laptop", "Phone", "Shirt"]);
+}

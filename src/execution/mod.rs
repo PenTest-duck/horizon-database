@@ -3,6 +3,9 @@
 //! Executes SQL statements against the storage layer. This module bridges
 //! the SQL parser/planner with the B+Tree storage, catalog, and MVCC layers.
 
+pub mod json;
+
+use std::collections::HashMap;
 use std::sync::Arc;
 use crate::btree::BTree;
 use crate::buffer::BufferPool;
@@ -13,6 +16,9 @@ use crate::planner::{LogicalPlan, plan_statement};
 use crate::sql::ast::*;
 use crate::types::{DataType, Value, determine_affinity};
 use crate::{QueryResult, Row};
+
+/// Stored CTE data: column names and row values.
+type CteStore = HashMap<String, (Vec<String>, Vec<Vec<Value>>)>;
 
 /// Execute a non-query statement (DDL, INSERT, UPDATE, DELETE).
 /// Returns the number of affected rows.
@@ -73,13 +79,32 @@ pub fn execute_query(
     stmt: &Statement,
     pool: &mut BufferPool,
     catalog: &mut Catalog,
-    _txn_mgr: &mut TransactionManager,
+    txn_mgr: &mut TransactionManager,
 ) -> Result<QueryResult> {
     match stmt {
         Statement::Select(select) => execute_select(select, pool, catalog),
         Statement::Pragma(pragma) => execute_pragma(pragma, pool, catalog),
         Statement::Explain(inner) => execute_explain(inner, catalog),
-        _ => Err(HorizonError::Internal("execute_query requires a SELECT, PRAGMA, or EXPLAIN statement".into())),
+        Statement::Insert(ins) if ins.returning.is_some() => {
+            execute_insert_returning(ins, pool, catalog, txn_mgr)
+        }
+        Statement::Update(upd) if upd.returning.is_some() => {
+            execute_update_returning(upd, pool, catalog, txn_mgr)
+        }
+        Statement::Delete(del) if del.returning.is_some() => {
+            execute_delete_returning(del, pool, catalog, txn_mgr)
+        }
+        _ => Err(HorizonError::Internal("execute_query requires a SELECT, PRAGMA, EXPLAIN, or RETURNING statement".into())),
+    }
+}
+
+/// Check whether a statement has a RETURNING clause.
+pub fn has_returning(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Insert(ins) => ins.returning.is_some(),
+        Statement::Update(upd) => upd.returning.is_some(),
+        Statement::Delete(del) => del.returning.is_some(),
+        _ => false,
     }
 }
 
@@ -340,107 +365,434 @@ fn execute_select(
     pool: &mut BufferPool,
     catalog: &mut Catalog,
 ) -> Result<QueryResult> {
-    // Check if we need plan-based execution (JOINs or aggregates)
-    let needs_plan = matches!(&select.from, Some(FromClause::Join { .. }))
-        || !select.group_by.is_empty()
-        || select.having.is_some()
-        || select_has_aggregate(&select.columns);
-
-    if needs_plan {
-        let stmt = Statement::Select(select.clone());
-        let plan = plan_statement(&stmt, catalog)?;
-        return execute_plan_select(&plan, pool, catalog);
-    }
-
-    // Get the table to scan
-    let (table_name, _alias) = match &select.from {
-        Some(FromClause::Table { name, alias }) => (name.clone(), alias.clone()),
-        Some(FromClause::Join { .. }) => {
-            unreachable!("JOINs handled by plan-based path above");
-        }
-        Some(FromClause::Subquery { .. }) => {
-            return Err(HorizonError::NotImplemented("subqueries in FROM".into()));
-        }
-        None => {
-            // SELECT without FROM -- evaluate expressions directly
-            return execute_select_no_from(select);
-        }
-    };
-
-    let table = catalog.get_table(&table_name)?.clone();
-    let data_tree = BTree::open(table.root_page);
-
-    // Try to use an index scan if the WHERE clause has a simple predicate
-    // on an indexed column.
-    let entries = if let Some(ref where_clause) = select.where_clause {
-        if let Some(index_entries) = try_index_scan(where_clause, &table_name, &table, pool, catalog)? {
-            index_entries
-        } else {
-            data_tree.scan_all(pool)?
-        }
+    // --- Phase 1: Process CTEs ---
+    let cte_store = if select.ctes.is_empty() {
+        CteStore::new()
     } else {
-        data_tree.scan_all(pool)?
+        execute_ctes(&select.ctes, pool, catalog)?
     };
 
-    // Determine output column names
-    let column_names = resolve_column_names(&select.columns, &table)?;
-    let columns = Arc::new(column_names);
+    // --- Phase 2: Execute base SELECT body ---
+    let (col_names, mut rows) = execute_select_body_inner(select, pool, catalog, &cte_store)?;
 
-    let mut rows = Vec::new();
+    // --- Phase 3: Handle compound operators (UNION/INTERSECT/EXCEPT) ---
+    if !select.compound.is_empty() {
+        for compound_op in &select.compound {
+            let rhs_stmt = select_body_to_statement(&compound_op.select);
+            let (_rhs_cols, rhs_rows) = execute_select_body_inner(&rhs_stmt, pool, catalog, &cte_store)?;
 
-    for entry in &entries {
-        // Deserialize row values
-        let row_values = deserialize_row(&entry.value, table.columns.len())?;
-
-        // Evaluate WHERE clause (still needed even with index scan for correctness,
-        // e.g. when index scan returns a superset for range queries).
-        // Use eval_expr_with_ctx to support subqueries (EXISTS, scalar subquery) in WHERE.
-        if let Some(ref where_clause) = select.where_clause {
-            let result = eval_expr_with_ctx(where_clause, &row_values, &table.columns, &table, pool, catalog)?;
-            if !result.to_bool() {
-                continue;
+            match compound_op.op {
+                CompoundType::UnionAll => {
+                    rows.extend(rhs_rows);
+                }
+                CompoundType::Union => {
+                    rows.extend(rhs_rows);
+                    let mut seen: Vec<Vec<Value>> = Vec::new();
+                    let mut unique = Vec::new();
+                    for row in rows {
+                        if !seen.contains(&row) {
+                            seen.push(row.clone());
+                            unique.push(row);
+                        }
+                    }
+                    rows = unique;
+                }
+                CompoundType::Intersect => {
+                    let mut result = Vec::new();
+                    for row in &rows {
+                        if rhs_rows.contains(row) && !result.contains(row) {
+                            result.push(row.clone());
+                        }
+                    }
+                    rows = result;
+                }
+                CompoundType::Except => {
+                    let mut result = Vec::new();
+                    for row in &rows {
+                        if !rhs_rows.contains(row) && !result.contains(row) {
+                            result.push(row.clone());
+                        }
+                    }
+                    rows = result;
+                }
             }
         }
 
-        // Project columns using subquery-aware evaluation
-        let projected = project_row_with_ctx(&select.columns, &row_values, &table, pool, catalog)?;
+        let columns = Arc::new(col_names);
+        let mut result_rows: Vec<Row> = rows
+            .into_iter()
+            .map(|values| Row { columns: columns.clone(), values })
+            .collect();
 
-        rows.push(Row {
-            columns: columns.clone(),
-            values: projected,
-        });
+        if !select.order_by.is_empty() {
+            sort_rows_by_index(&mut result_rows, &select.order_by, &columns)?;
+        }
+        if let Some(ref offset_expr) = select.offset {
+            let offset = eval_const_expr(offset_expr).as_integer().unwrap_or(0) as usize;
+            if offset < result_rows.len() { result_rows = result_rows.into_iter().skip(offset).collect(); }
+            else { result_rows.clear(); }
+        }
+        if let Some(ref limit_expr) = select.limit {
+            let limit = eval_const_expr(limit_expr).as_integer().unwrap_or(i64::MAX) as usize;
+            result_rows.truncate(limit);
+        }
+        return Ok(QueryResult { columns, rows: result_rows });
     }
 
-    // Handle ORDER BY
-    if !select.order_by.is_empty() {
-        sort_rows(&mut rows, &select.order_by, &table)?;
-    }
+    // --- Phase 4: No compound -- wrap up ---
+    let columns = Arc::new(col_names);
+    let result_rows: Vec<Row> = rows
+        .into_iter()
+        .map(|values| Row { columns: columns.clone(), values })
+        .collect();
+    Ok(QueryResult { columns, rows: result_rows })
+}
 
-    // Handle DISTINCT
-    if select.distinct {
-        rows.dedup_by(|a, b| a.values == b.values);
+fn select_body_to_statement(body: &SelectBody) -> SelectStatement {
+    SelectStatement {
+        ctes: vec![], distinct: body.distinct, columns: body.columns.clone(),
+        from: body.from.clone(), where_clause: body.where_clause.clone(),
+        group_by: body.group_by.clone(), having: body.having.clone(),
+        order_by: vec![], limit: None, offset: None, compound: vec![],
     }
+}
 
-    // Handle LIMIT / OFFSET
-    if let Some(ref offset_expr) = select.offset {
-        let offset = eval_const_expr(offset_expr)
-            .as_integer()
-            .unwrap_or(0) as usize;
-        if offset < rows.len() {
-            rows = rows.into_iter().skip(offset).collect();
+fn execute_ctes(ctes: &[Cte], pool: &mut BufferPool, catalog: &mut Catalog) -> Result<CteStore> {
+    let mut store = CteStore::new();
+    for cte in ctes {
+        if cte.recursive {
+            execute_recursive_cte(cte, pool, catalog, &mut store)?;
         } else {
-            rows.clear();
+            let (col_names, rows) = execute_cte_query(&cte.query, pool, catalog, &store)?;
+            let final_col_names = if let Some(ref cte_cols) = cte.columns { cte_cols.clone() } else { col_names };
+            store.insert(cte.name.to_lowercase(), (final_col_names, rows));
         }
     }
+    Ok(store)
+}
 
+fn execute_recursive_cte(cte: &Cte, pool: &mut BufferPool, catalog: &mut Catalog, store: &mut CteStore) -> Result<()> {
+    let anchor_stmt = &cte.query;
+    let anchor_only = SelectStatement {
+        ctes: vec![], distinct: anchor_stmt.distinct, columns: anchor_stmt.columns.clone(),
+        from: anchor_stmt.from.clone(), where_clause: anchor_stmt.where_clause.clone(),
+        group_by: anchor_stmt.group_by.clone(), having: anchor_stmt.having.clone(),
+        order_by: vec![], limit: None, offset: None, compound: vec![],
+    };
+    let (anchor_cols, anchor_rows) = execute_cte_query(&anchor_only, pool, catalog, store)?;
+    let col_names = if let Some(ref cte_cols) = cte.columns { cte_cols.clone() } else { anchor_cols };
+    let mut all_rows = anchor_rows.clone();
+    let mut working_table = anchor_rows;
+    const MAX_RECURSION_DEPTH: usize = 10_000;
+    let mut depth = 0;
+    while !working_table.is_empty() && depth < MAX_RECURSION_DEPTH {
+        depth += 1;
+        store.insert(cte.name.to_lowercase(), (col_names.clone(), working_table.clone()));
+        let mut new_rows = Vec::new();
+        for compound_op in &anchor_stmt.compound {
+            let rhs_stmt = select_body_to_statement(&compound_op.select);
+            let (_rhs_cols, rhs_rows) = execute_cte_query(&rhs_stmt, pool, catalog, store)?;
+            new_rows.extend(rhs_rows);
+        }
+        if new_rows.is_empty() { break; }
+        all_rows.extend(new_rows.clone());
+        working_table = new_rows;
+    }
+    store.insert(cte.name.to_lowercase(), (col_names, all_rows));
+    Ok(())
+}
+
+fn execute_cte_query(select: &SelectStatement, pool: &mut BufferPool, catalog: &mut Catalog, cte_store: &CteStore) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    execute_select_body_inner(select, pool, catalog, cte_store)
+}
+
+fn execute_select_body_inner(
+    select: &SelectStatement, pool: &mut BufferPool, catalog: &mut Catalog, cte_store: &CteStore,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    if let Some(ref from) = select.from {
+        if let Some(cte_result) = try_resolve_cte_from(from, cte_store) {
+            return execute_select_from_cte(select, cte_result, pool, catalog);
+        }
+        if from_contains_cte(from, cte_store) {
+            return execute_select_with_cte_join(select, pool, catalog, cte_store);
+        }
+    }
+    if select_has_window_function(&select.columns) {
+        let result = execute_select_with_window_functions(select, pool, catalog)?;
+        let col_names = result.columns.as_ref().clone();
+        let rows = result.rows.into_iter().map(|r| r.values).collect();
+        return Ok((col_names, rows));
+    }
+    let needs_plan = matches!(&select.from, Some(FromClause::Join { .. }))
+        || !select.group_by.is_empty() || select.having.is_some()
+        || select_has_aggregate(&select.columns);
+    if needs_plan {
+        let stmt = Statement::Select(select.clone());
+        let plan = plan_statement(&stmt, catalog)?;
+        let result = execute_plan_select(&plan, pool, catalog)?;
+        let col_names = result.columns.as_ref().clone();
+        let rows = result.rows.into_iter().map(|r| r.values).collect();
+        return Ok((col_names, rows));
+    }
+    let (table_name, _alias) = match &select.from {
+        Some(FromClause::Table { name, alias }) => (name.clone(), alias.clone()),
+        Some(FromClause::Join { .. }) => { unreachable!(); }
+        Some(FromClause::Subquery { .. }) => { return Err(HorizonError::NotImplemented("subqueries in FROM".into())); }
+        None => {
+            let result = execute_select_no_from(select)?;
+            let col_names = result.columns.as_ref().clone();
+            let rows = result.rows.into_iter().map(|r| r.values).collect();
+            return Ok((col_names, rows));
+        }
+    };
+    let table = catalog.get_table(&table_name)?.clone();
+    let data_tree = BTree::open(table.root_page);
+    let entries = if let Some(ref where_clause) = select.where_clause {
+        if let Some(index_entries) = try_index_scan(where_clause, &table_name, &table, pool, catalog)? {
+            index_entries
+        } else { data_tree.scan_all(pool)? }
+    } else { data_tree.scan_all(pool)? };
+    let column_names = resolve_column_names(&select.columns, &table)?;
+    let mut rows = Vec::new();
+    for entry in &entries {
+        let row_values = deserialize_row(&entry.value, table.columns.len())?;
+        if let Some(ref where_clause) = select.where_clause {
+            let result = eval_expr_with_ctx(where_clause, &row_values, &table.columns, &table, pool, catalog)?;
+            if !result.to_bool() { continue; }
+        }
+        rows.push(project_row_with_ctx(&select.columns, &row_values, &table, pool, catalog)?);
+    }
+    if !select.order_by.is_empty() {
+        let columns_arc = Arc::new(column_names.clone());
+        let mut result_rows: Vec<Row> = rows.into_iter()
+            .map(|values| Row { columns: columns_arc.clone(), values }).collect();
+        sort_rows(&mut result_rows, &select.order_by, &table)?;
+        rows = result_rows.into_iter().map(|r| r.values).collect();
+    }
+    if select.distinct {
+        let mut seen: Vec<Vec<Value>> = Vec::new();
+        let mut unique = Vec::new();
+        for row in rows { if !seen.contains(&row) { seen.push(row.clone()); unique.push(row); } }
+        rows = unique;
+    }
+    if let Some(ref offset_expr) = select.offset {
+        let offset = eval_const_expr(offset_expr).as_integer().unwrap_or(0) as usize;
+        if offset < rows.len() { rows = rows.into_iter().skip(offset).collect(); } else { rows.clear(); }
+    }
     if let Some(ref limit_expr) = select.limit {
-        let limit = eval_const_expr(limit_expr)
-            .as_integer()
-            .unwrap_or(i64::MAX) as usize;
+        let limit = eval_const_expr(limit_expr).as_integer().unwrap_or(i64::MAX) as usize;
         rows.truncate(limit);
     }
+    Ok((column_names, rows))
+}
 
-    Ok(QueryResult { columns, rows })
+fn try_resolve_cte_from<'a>(from: &FromClause, cte_store: &'a CteStore) -> Option<&'a (Vec<String>, Vec<Vec<Value>>)> {
+    match from { FromClause::Table { name, .. } => cte_store.get(&name.to_lowercase()), _ => None }
+}
+
+fn from_contains_cte(from: &FromClause, cte_store: &CteStore) -> bool {
+    match from {
+        FromClause::Table { name, .. } => cte_store.contains_key(&name.to_lowercase()),
+        FromClause::Join { left, right, .. } => from_contains_cte(left, cte_store) || from_contains_cte(right, cte_store),
+        FromClause::Subquery { .. } => false,
+    }
+}
+
+fn execute_select_from_cte(
+    select: &SelectStatement, cte_data: &(Vec<String>, Vec<Vec<Value>>), pool: &mut BufferPool, catalog: &mut Catalog,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let (cte_col_names, cte_rows) = cte_data;
+    if !select.group_by.is_empty() || select.having.is_some() || select_has_aggregate(&select.columns) {
+        return execute_cte_with_aggregates(select, cte_col_names, cte_rows, pool, catalog);
+    }
+    let out_col_names = resolve_column_names_from_cte(&select.columns, cte_col_names)?;
+    let mut rows = Vec::new();
+    for row_values in cte_rows {
+        if let Some(ref where_clause) = select.where_clause {
+            let result = eval_expr_dynamic_with_ctx(where_clause, row_values, cte_col_names, pool, catalog)?;
+            if !result.to_bool() { continue; }
+        }
+        rows.push(project_row_dynamic(&select.columns, row_values, cte_col_names)?);
+    }
+    if !select.order_by.is_empty() { sort_rows_dynamic(&mut rows, &select.order_by, &out_col_names)?; }
+    if select.distinct {
+        let mut seen: Vec<Vec<Value>> = Vec::new(); let mut unique = Vec::new();
+        for row in rows { if !seen.contains(&row) { seen.push(row.clone()); unique.push(row); } }
+        rows = unique;
+    }
+    if let Some(ref offset_expr) = select.offset {
+        let offset = eval_const_expr(offset_expr).as_integer().unwrap_or(0) as usize;
+        if offset < rows.len() { rows = rows.into_iter().skip(offset).collect(); } else { rows.clear(); }
+    }
+    if let Some(ref limit_expr) = select.limit {
+        let limit = eval_const_expr(limit_expr).as_integer().unwrap_or(i64::MAX) as usize; rows.truncate(limit);
+    }
+    Ok((out_col_names, rows))
+}
+
+fn execute_cte_with_aggregates(
+    select: &SelectStatement, cte_col_names: &[String], cte_rows: &[Vec<Value>], pool: &mut BufferPool, catalog: &mut Catalog,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let mut filtered_rows = Vec::new();
+    for row_values in cte_rows {
+        if let Some(ref where_clause) = select.where_clause {
+            let result = eval_expr_dynamic_with_ctx(where_clause, row_values, cte_col_names, pool, catalog)?;
+            if !result.to_bool() { continue; }
+        }
+        filtered_rows.push(row_values.clone());
+    }
+    let groups = group_rows(&filtered_rows, &select.group_by, cte_col_names)?;
+    let out_col_names = resolve_column_names_dynamic(&select.columns, cte_col_names)?;
+    let mut result = Vec::new();
+    for (_key, group) in &groups {
+        let representative = if group.is_empty() { vec![Value::Null; cte_col_names.len()] } else { group[0].clone() };
+        if let Some(ref having_expr) = select.having {
+            if !eval_aggregate_expr(having_expr, &representative, cte_col_names, group)?.to_bool() { continue; }
+        }
+        let mut out_row = Vec::new();
+        for col in &select.columns {
+            match col {
+                SelectColumn::AllColumns => out_row.extend(representative.iter().cloned()),
+                SelectColumn::TableAllColumns(_) => out_row.extend(representative.iter().cloned()),
+                SelectColumn::Expr { expr, .. } => { out_row.push(eval_aggregate_expr(expr, &representative, cte_col_names, group)?); }
+            }
+        }
+        result.push(out_row);
+    }
+    Ok((out_col_names, result))
+}
+
+fn execute_select_with_cte_join(
+    select: &SelectStatement, pool: &mut BufferPool, catalog: &mut Catalog, cte_store: &CteStore,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let from = select.from.as_ref().unwrap();
+    let (merged_cols, mut result_rows) = execute_from_with_ctes(from, pool, catalog, cte_store)?;
+    if let Some(ref where_clause) = select.where_clause {
+        let mut filtered = Vec::new();
+        for row in result_rows { if eval_expr_dynamic(where_clause, &row, &merged_cols)?.to_bool() { filtered.push(row); } }
+        result_rows = filtered;
+    }
+    if !select.group_by.is_empty() || select.having.is_some() || select_has_aggregate(&select.columns) {
+        let groups = group_rows(&result_rows, &select.group_by, &merged_cols)?;
+        let out_col_names = resolve_column_names_dynamic(&select.columns, &merged_cols)?;
+        let mut result = Vec::new();
+        for (_key, group) in &groups {
+            let representative = if group.is_empty() { vec![Value::Null; merged_cols.len()] } else { group[0].clone() };
+            if let Some(ref having_expr) = select.having {
+                if !eval_aggregate_expr(having_expr, &representative, &merged_cols, group)?.to_bool() { continue; }
+            }
+            let mut out_row = Vec::new();
+            for col in &select.columns { match col {
+                SelectColumn::AllColumns => out_row.extend(representative.iter().cloned()),
+                SelectColumn::TableAllColumns(_) => out_row.extend(representative.iter().cloned()),
+                SelectColumn::Expr { expr, .. } => { out_row.push(eval_aggregate_expr(expr, &representative, &merged_cols, group)?); }
+            }}
+            result.push(out_row);
+        }
+        return Ok((out_col_names, result));
+    }
+    let out_col_names = resolve_column_names_dynamic(&select.columns, &merged_cols)?;
+    let mut out_rows = Vec::new();
+    for row in &result_rows { out_rows.push(project_row_dynamic(&select.columns, row, &merged_cols)?); }
+    if !select.order_by.is_empty() { sort_rows_dynamic(&mut out_rows, &select.order_by, &out_col_names)?; }
+    if select.distinct {
+        let mut seen: Vec<Vec<Value>> = Vec::new(); let mut unique = Vec::new();
+        for row in out_rows { if !seen.contains(&row) { seen.push(row.clone()); unique.push(row); } }
+        out_rows = unique;
+    }
+    if let Some(ref offset_expr) = select.offset {
+        let offset = eval_const_expr(offset_expr).as_integer().unwrap_or(0) as usize;
+        if offset < out_rows.len() { out_rows = out_rows.into_iter().skip(offset).collect(); } else { out_rows.clear(); }
+    }
+    if let Some(ref limit_expr) = select.limit {
+        let limit = eval_const_expr(limit_expr).as_integer().unwrap_or(i64::MAX) as usize; out_rows.truncate(limit);
+    }
+    Ok((out_col_names, out_rows))
+}
+
+fn execute_from_with_ctes(from: &FromClause, pool: &mut BufferPool, catalog: &mut Catalog, cte_store: &CteStore) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    match from {
+        FromClause::Table { name, alias } => {
+            if let Some((cte_cols, cte_rows)) = cte_store.get(&name.to_lowercase()) {
+                let prefix = alias.as_deref().unwrap_or(name);
+                Ok((cte_cols.iter().map(|c| format!("{}.{}", prefix, c)).collect(), cte_rows.clone()))
+            } else {
+                let table_info = catalog.get_table(name)?.clone();
+                let data_tree = BTree::open(table_info.root_page);
+                let entries = data_tree.scan_all(pool)?;
+                let prefix = alias.as_deref().unwrap_or(name);
+                let col_names: Vec<String> = table_info.columns.iter().map(|c| format!("{}.{}", prefix, c.name)).collect();
+                let mut rows = Vec::new();
+                for entry in &entries { rows.push(deserialize_row(&entry.value, table_info.columns.len())?); }
+                Ok((col_names, rows))
+            }
+        }
+        FromClause::Join { left, right, join_type, on } => {
+            let (left_cols, left_rows) = execute_from_with_ctes(left, pool, catalog, cte_store)?;
+            let (right_cols, right_rows) = execute_from_with_ctes(right, pool, catalog, cte_store)?;
+            let num_right = right_cols.len(); let num_left = left_cols.len();
+            let mut merged_cols = left_cols.clone(); merged_cols.extend(right_cols.clone());
+            let null_right: Vec<Value> = vec![Value::Null; num_right];
+            let null_left: Vec<Value> = vec![Value::Null; num_left];
+            let mut result = Vec::new();
+            match join_type {
+                JoinType::Inner => { for l in &left_rows { for r in &right_rows {
+                    let mut m = l.clone(); m.extend(r.iter().cloned());
+                    if let Some(ref e) = on { if !eval_expr_dynamic(e, &m, &merged_cols)?.to_bool() { continue; } }
+                    result.push(m);
+                }}}
+                JoinType::Left => { for l in &left_rows { let mut matched = false; for r in &right_rows {
+                    let mut m = l.clone(); m.extend(r.iter().cloned());
+                    if let Some(ref e) = on { if !eval_expr_dynamic(e, &m, &merged_cols)?.to_bool() { continue; } }
+                    matched = true; result.push(m);
+                } if !matched { let mut m = l.clone(); m.extend(null_right.iter().cloned()); result.push(m); } }}
+                JoinType::Right => { for r in &right_rows { let mut matched = false; for l in &left_rows {
+                    let mut m = l.clone(); m.extend(r.iter().cloned());
+                    if let Some(ref e) = on { if !eval_expr_dynamic(e, &m, &merged_cols)?.to_bool() { continue; } }
+                    matched = true; result.push(m);
+                } if !matched { let mut m = null_left.clone(); m.extend(r.iter().cloned()); result.push(m); } }}
+                JoinType::Cross => { for l in &left_rows { for r in &right_rows {
+                    let mut m = l.clone(); m.extend(r.iter().cloned()); result.push(m);
+                }}}
+            }
+            Ok((merged_cols, result))
+        }
+        FromClause::Subquery { .. } => Err(HorizonError::NotImplemented("subquery in FROM with CTEs".into())),
+    }
+}
+
+fn resolve_column_names_from_cte(select_cols: &[SelectColumn], cte_col_names: &[String]) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for col in select_cols { match col {
+        SelectColumn::AllColumns => names.extend(cte_col_names.iter().cloned()),
+        SelectColumn::TableAllColumns(prefix) => {
+            let prefix_dot = format!("{}.", prefix);
+            for c in cte_col_names {
+                if c.to_lowercase().starts_with(&prefix_dot.to_lowercase()) { names.push(c[prefix_dot.len()..].to_string()); }
+                else { names.push(c.clone()); }
+            }
+        }
+        SelectColumn::Expr { expr, alias } => {
+            if let Some(a) = alias { names.push(a.clone()); }
+            else if let Expr::Column { name, .. } = expr { names.push(name.clone()); }
+            else if let Expr::Function { name, .. } = expr { names.push(name.clone()); }
+            else { names.push(format!("{:?}", expr)); }
+        }
+    }}
+    Ok(names)
+}
+
+fn sort_rows_by_index(rows: &mut [Row], order_by: &[OrderByItem], col_names: &[String]) -> Result<()> {
+    rows.sort_by(|a, b| {
+        for item in order_by {
+            let va = eval_expr_dynamic(&item.expr, &a.values, col_names).unwrap_or(Value::Null);
+            let vb = eval_expr_dynamic(&item.expr, &b.values, col_names).unwrap_or(Value::Null);
+            let cmp = if item.desc { va.cmp(&vb).reverse() } else { va.cmp(&vb) };
+            if cmp != std::cmp::Ordering::Equal { return cmp; }
+        }
+        std::cmp::Ordering::Equal
+    });
+    Ok(())
 }
 
 /// Check if any select columns contain aggregate function calls.
@@ -476,6 +828,286 @@ fn expr_has_aggregate_fn(expr: &Expr) -> bool {
         Expr::UnaryOp { expr, .. } => expr_has_aggregate_fn(expr),
         Expr::Cast { expr, .. } => expr_has_aggregate_fn(expr),
         _ => false,
+    }
+}
+
+/// Check if any select columns contain window function calls.
+fn select_has_window_function(columns: &[SelectColumn]) -> bool {
+    columns.iter().any(|col| {
+        if let SelectColumn::Expr { expr, .. } = col { expr_has_window_fn(expr) } else { false }
+    })
+}
+
+/// Recursively check if an expression contains a window function.
+fn expr_has_window_fn(expr: &Expr) -> bool {
+    match expr {
+        Expr::WindowFunction { .. } => true,
+        Expr::BinaryOp { left, right, .. } => expr_has_window_fn(left) || expr_has_window_fn(right),
+        Expr::UnaryOp { expr, .. } => expr_has_window_fn(expr),
+        Expr::Cast { expr, .. } => expr_has_window_fn(expr),
+        _ => false,
+    }
+}
+
+// ---- Window Function Execution ----
+
+fn execute_select_with_window_functions(
+    select: &SelectStatement, pool: &mut BufferPool, catalog: &mut Catalog,
+) -> Result<QueryResult> {
+    let (table_name, _alias) = match &select.from {
+        Some(FromClause::Table { name, alias }) => (name.clone(), alias.clone()),
+        Some(FromClause::Join { .. }) => return Err(HorizonError::NotImplemented("window functions with JOINs".into())),
+        Some(FromClause::Subquery { .. }) => return Err(HorizonError::NotImplemented("window functions with subqueries".into())),
+        None => return Err(HorizonError::InvalidSql("window functions require a FROM clause".into())),
+    };
+    let table = catalog.get_table(&table_name)?.clone();
+    let data_tree = BTree::open(table.root_page);
+    let entries = data_tree.scan_all(pool)?;
+    let mut base_rows: Vec<Vec<Value>> = Vec::new();
+    for entry in &entries {
+        let row_values = deserialize_row(&entry.value, table.columns.len())?;
+        if let Some(ref wc) = select.where_clause {
+            if !eval_expr(wc, &row_values, &table.columns, &table)?.to_bool() { continue; }
+        }
+        base_rows.push(row_values);
+    }
+    let column_names = resolve_column_names_for_window(&select.columns, &table)?;
+    let columns_arc = Arc::new(column_names);
+    let total = base_rows.len();
+    let mut result_rows: Vec<Vec<Value>> = vec![Vec::new(); total];
+    for sel_col in &select.columns {
+        match sel_col {
+            SelectColumn::AllColumns | SelectColumn::TableAllColumns(_) => {
+                for (i, row) in base_rows.iter().enumerate() { result_rows[i].extend(row.iter().cloned()); }
+            }
+            SelectColumn::Expr { expr, .. } => {
+                if expr_has_window_fn(expr) {
+                    let wv = evaluate_window_expr(expr, &base_rows, &table)?;
+                    for (i, val) in wv.into_iter().enumerate() { result_rows[i].push(val); }
+                } else {
+                    for (i, row) in base_rows.iter().enumerate() {
+                        result_rows[i].push(eval_expr(expr, row, &table.columns, &table)?);
+                    }
+                }
+            }
+        }
+    }
+    let mut rows: Vec<Row> = result_rows.into_iter()
+        .map(|values| Row { columns: columns_arc.clone(), values }).collect();
+    if !select.order_by.is_empty() { sort_rows(&mut rows, &select.order_by, &table)?; }
+    if select.distinct { rows.dedup_by(|a, b| a.values == b.values); }
+    if let Some(ref oe) = select.offset {
+        let o = eval_const_expr(oe).as_integer().unwrap_or(0) as usize;
+        if o < rows.len() { rows = rows.into_iter().skip(o).collect(); } else { rows.clear(); }
+    }
+    if let Some(ref le) = select.limit {
+        rows.truncate(eval_const_expr(le).as_integer().unwrap_or(i64::MAX) as usize);
+    }
+    Ok(QueryResult { columns: columns_arc, rows })
+}
+
+fn resolve_column_names_for_window(cols: &[SelectColumn], table: &TableInfo) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for col in cols {
+        match col {
+            SelectColumn::AllColumns | SelectColumn::TableAllColumns(_) => {
+                for c in &table.columns { names.push(c.name.clone()); }
+            }
+            SelectColumn::Expr { expr, alias } => {
+                if let Some(a) = alias { names.push(a.clone()); }
+                else if let Expr::Column { name, .. } = expr { names.push(name.clone()); }
+                else if let Expr::WindowFunction { function, .. } = expr {
+                    if let Expr::Function { name, .. } = function.as_ref() { names.push(name.clone()); }
+                    else { names.push(format!("{:?}", expr)); }
+                } else if let Expr::Function { name, .. } = expr { names.push(name.clone()); }
+                else { names.push(format!("{:?}", expr)); }
+            }
+        }
+    }
+    Ok(names)
+}
+
+fn evaluate_window_expr(expr: &Expr, all_rows: &[Vec<Value>], table: &TableInfo) -> Result<Vec<Value>> {
+    if let Expr::WindowFunction { function, partition_by, order_by, frame } = expr {
+        compute_window_function(function, partition_by, order_by, frame, all_rows, table)
+    } else {
+        all_rows.iter().map(|row| eval_expr(expr, row, &table.columns, table)).collect()
+    }
+}
+
+fn compute_window_function(
+    function: &Expr, partition_by: &[Expr], order_by: &[OrderByItem],
+    frame: &Option<WindowFrame>, all_rows: &[Vec<Value>], table: &TableInfo,
+) -> Result<Vec<Value>> {
+    let total = all_rows.len();
+    let mut results = vec![Value::Null; total];
+    let mut partition_map: Vec<(Vec<Value>, Vec<usize>)> = Vec::new();
+    for (i, row) in all_rows.iter().enumerate() {
+        let key: Vec<Value> = partition_by.iter()
+            .map(|e| eval_expr(e, row, &table.columns, table)).collect::<Result<_>>()?;
+        if let Some((_, indices)) = partition_map.iter_mut().find(|(k, _)| *k == key) {
+            indices.push(i);
+        } else { partition_map.push((key, vec![i])); }
+    }
+    let (func_name, func_args) = match function {
+        Expr::Function { name, args, .. } => (name.to_uppercase(), args.clone()),
+        _ => return Err(HorizonError::InvalidSql("expected function call in window function".into())),
+    };
+    for (_key, mut indices) in partition_map {
+        if !order_by.is_empty() {
+            indices.sort_by(|&a, &b| {
+                for item in order_by {
+                    let va = eval_expr(&item.expr, &all_rows[a], &table.columns, table).unwrap_or(Value::Null);
+                    let vb = eval_expr(&item.expr, &all_rows[b], &table.columns, table).unwrap_or(Value::Null);
+                    let cmp = if item.desc { va.cmp(&vb).reverse() } else { va.cmp(&vb) };
+                    if cmp != std::cmp::Ordering::Equal { return cmp; }
+                }
+                std::cmp::Ordering::Equal
+            });
+        }
+        let pl = indices.len();
+        match func_name.as_str() {
+            "ROW_NUMBER" => {
+                for (r, &oi) in indices.iter().enumerate() { results[oi] = Value::Integer((r + 1) as i64); }
+            }
+            "RANK" => {
+                let mut rank = 1i64;
+                for pos in 0..pl {
+                    if pos > 0 && !ob_eq(order_by, &all_rows[indices[pos]], &all_rows[indices[pos-1]], table) { rank = (pos+1) as i64; }
+                    results[indices[pos]] = Value::Integer(rank);
+                }
+            }
+            "DENSE_RANK" => {
+                let mut rank = 1i64;
+                for pos in 0..pl {
+                    if pos > 0 && !ob_eq(order_by, &all_rows[indices[pos]], &all_rows[indices[pos-1]], table) { rank += 1; }
+                    results[indices[pos]] = Value::Integer(rank);
+                }
+            }
+            "LAG" => {
+                let off = if func_args.len() > 1 { eval_const_expr(&func_args[1]).as_integer().unwrap_or(1) as usize } else { 1 };
+                let def = if func_args.len() > 2 { eval_const_expr(&func_args[2]) } else { Value::Null };
+                for pos in 0..pl {
+                    results[indices[pos]] = if pos >= off && !func_args.is_empty() {
+                        eval_expr(&func_args[0], &all_rows[indices[pos-off]], &table.columns, table)?
+                    } else if pos >= off { Value::Null } else { def.clone() };
+                }
+            }
+            "LEAD" => {
+                let off = if func_args.len() > 1 { eval_const_expr(&func_args[1]).as_integer().unwrap_or(1) as usize } else { 1 };
+                let def = if func_args.len() > 2 { eval_const_expr(&func_args[2]) } else { Value::Null };
+                for pos in 0..pl {
+                    results[indices[pos]] = if pos + off < pl && !func_args.is_empty() {
+                        eval_expr(&func_args[0], &all_rows[indices[pos+off]], &table.columns, table)?
+                    } else if pos + off < pl { Value::Null } else { def.clone() };
+                }
+            }
+            "FIRST_VALUE" => {
+                for pos in 0..pl {
+                    let (fs, _) = wf_frame(frame, pos, pl, !order_by.is_empty());
+                    results[indices[pos]] = if !func_args.is_empty() { eval_expr(&func_args[0], &all_rows[indices[fs]], &table.columns, table)? } else { Value::Null };
+                }
+            }
+            "LAST_VALUE" => {
+                for pos in 0..pl {
+                    let (_, fe) = wf_frame(frame, pos, pl, !order_by.is_empty());
+                    results[indices[pos]] = if !func_args.is_empty() { eval_expr(&func_args[0], &all_rows[indices[fe]], &table.columns, table)? } else { Value::Null };
+                }
+            }
+            "SUM" => {
+                for pos in 0..pl {
+                    let (fs, fe) = wf_frame(frame, pos, pl, !order_by.is_empty());
+                    let mut is = 0i64; let mut rs = 0.0f64; let mut hr = false; let mut an = true;
+                    for fi in fs..=fe {
+                        if let Ok(v) = if !func_args.is_empty() { eval_expr(&func_args[0], &all_rows[indices[fi]], &table.columns, table) } else { Ok(Value::Null) } {
+                            match v { Value::Integer(n) => { is += n; an = false; } Value::Real(r) => { rs += r; hr = true; an = false; } _ => {} }
+                        }
+                    }
+                    results[indices[pos]] = if an { Value::Null } else if hr { Value::Real(rs + is as f64) } else { Value::Integer(is) };
+                }
+            }
+            "COUNT" => {
+                let star = func_args.len() == 1 && matches!(&func_args[0], Expr::Column { table: None, name } if name == "*");
+                for pos in 0..pl {
+                    let (fs, fe) = wf_frame(frame, pos, pl, !order_by.is_empty());
+                    let mut c = 0i64;
+                    for fi in fs..=fe {
+                        if func_args.is_empty() || star { c += 1; }
+                        else if let Ok(v) = eval_expr(&func_args[0], &all_rows[indices[fi]], &table.columns, table) { if !v.is_null() { c += 1; } }
+                    }
+                    results[indices[pos]] = Value::Integer(c);
+                }
+            }
+            "AVG" => {
+                for pos in 0..pl {
+                    let (fs, fe) = wf_frame(frame, pos, pl, !order_by.is_empty());
+                    let mut s = 0.0f64; let mut c = 0i64;
+                    for fi in fs..=fe {
+                        if let Ok(v) = if !func_args.is_empty() { eval_expr(&func_args[0], &all_rows[indices[fi]], &table.columns, table) } else { Ok(Value::Null) } {
+                            match v { Value::Integer(n) => { s += n as f64; c += 1; } Value::Real(r) => { s += r; c += 1; } _ => {} }
+                        }
+                    }
+                    results[indices[pos]] = if c == 0 { Value::Null } else { Value::Real(s / c as f64) };
+                }
+            }
+            "MIN" => {
+                for pos in 0..pl {
+                    let (fs, fe) = wf_frame(frame, pos, pl, !order_by.is_empty());
+                    let mut mv: Option<Value> = None;
+                    for fi in fs..=fe {
+                        if let Ok(v) = if !func_args.is_empty() { eval_expr(&func_args[0], &all_rows[indices[fi]], &table.columns, table) } else { Ok(Value::Null) } {
+                            if !v.is_null() { mv = Some(mv.map_or(v.clone(), |cur| if v < cur { v } else { cur })); }
+                        }
+                    }
+                    results[indices[pos]] = mv.unwrap_or(Value::Null);
+                }
+            }
+            "MAX" => {
+                for pos in 0..pl {
+                    let (fs, fe) = wf_frame(frame, pos, pl, !order_by.is_empty());
+                    let mut mv: Option<Value> = None;
+                    for fi in fs..=fe {
+                        if let Ok(v) = if !func_args.is_empty() { eval_expr(&func_args[0], &all_rows[indices[fi]], &table.columns, table) } else { Ok(Value::Null) } {
+                            if !v.is_null() { mv = Some(mv.map_or(v.clone(), |cur| if v > cur { v } else { cur })); }
+                        }
+                    }
+                    results[indices[pos]] = mv.unwrap_or(Value::Null);
+                }
+            }
+            _ => return Err(HorizonError::NotImplemented(format!("window function: {}", func_name))),
+        }
+    }
+    Ok(results)
+}
+
+fn ob_eq(order_by: &[OrderByItem], a: &[Value], b: &[Value], table: &TableInfo) -> bool {
+    order_by.iter().all(|item| {
+        eval_expr(&item.expr, a, &table.columns, table).unwrap_or(Value::Null)
+            == eval_expr(&item.expr, b, &table.columns, table).unwrap_or(Value::Null)
+    })
+}
+
+fn wf_frame(frame: &Option<WindowFrame>, pos: usize, pl: usize, has_order_by: bool) -> (usize, usize) {
+    match frame {
+        Some(f) => {
+            let s = wf_bound(&f.start, pos, pl);
+            let e = f.end.as_ref().map_or(pos, |b| wf_bound(b, pos, pl));
+            (s, e)
+        }
+        // SQL standard: without ORDER BY the default frame is the entire partition;
+        // with ORDER BY the default is UNBOUNDED PRECEDING to CURRENT ROW.
+        None if has_order_by => (0, pos),
+        None => (0, pl.saturating_sub(1)),
+    }
+}
+
+fn wf_bound(bound: &WindowFrameBound, pos: usize, pl: usize) -> usize {
+    match bound {
+        WindowFrameBound::CurrentRow => pos,
+        WindowFrameBound::Preceding(None) => 0,
+        WindowFrameBound::Preceding(Some(e)) => pos.saturating_sub(eval_const_expr(e).as_integer().unwrap_or(0) as usize),
+        WindowFrameBound::Following(None) => pl.saturating_sub(1),
+        WindowFrameBound::Following(Some(e)) => (pos + eval_const_expr(e).as_integer().unwrap_or(0) as usize).min(pl.saturating_sub(1)),
     }
 }
 
@@ -947,6 +1579,12 @@ fn eval_expr_dynamic(
         Expr::Subquery(_) | Expr::Exists(_) => {
             Err(HorizonError::NotImplemented("subqueries in expressions".into()))
         }
+        Expr::WindowFunction { .. } => {
+            // Window functions are evaluated at a higher level, not per-row.
+            Err(HorizonError::Internal(
+                "window functions must be evaluated via the window execution path".into(),
+            ))
+        }
     }
 }
 
@@ -1259,7 +1897,269 @@ fn eval_function_dynamic(
                 eval_expr_dynamic(&args[2], row, col_names)
             }
         }
+        // -- JSON functions --
+        "JSON" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr_dynamic(&args[0], row, col_names)?;
+            match val {
+                Value::Text(s) => {
+                    match json::JsonParser::parse(&s) {
+                        Some(jv) => Ok(Value::Text(jv.to_json_string())),
+                        None => Err(HorizonError::InvalidSql("malformed JSON".into())),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Err(HorizonError::InvalidSql("JSON() requires a text argument".into())),
+            }
+        }
+        "JSON_EXTRACT" => {
+            if args.len() < 2 { return Ok(Value::Null); }
+            let json_val = eval_expr_dynamic(&args[0], row, col_names)?;
+            let path_val = eval_expr_dynamic(&args[1], row, col_names)?;
+            match (json_val, path_val) {
+                (Value::Text(s), Value::Text(path)) => {
+                    match json::JsonParser::parse(&s) {
+                        Some(jv) => {
+                            match jv.extract_path(&path) {
+                                Some(extracted) => Ok(json::json_value_to_sql(extracted)),
+                                None => Ok(Value::Null),
+                            }
+                        }
+                        None => Ok(Value::Null),
+                    }
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "JSON_TYPE" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let json_val = eval_expr_dynamic(&args[0], row, col_names)?;
+            match json_val {
+                Value::Text(s) => {
+                    match json::JsonParser::parse(&s) {
+                        Some(jv) => {
+                            if args.len() >= 2 {
+                                let path_val = eval_expr_dynamic(&args[1], row, col_names)?;
+                                if let Value::Text(path) = path_val {
+                                    match jv.extract_path(&path) {
+                                        Some(extracted) => Ok(Value::Text(extracted.json_type_name().to_string())),
+                                        None => Ok(Value::Null),
+                                    }
+                                } else {
+                                    Ok(Value::Null)
+                                }
+                            } else {
+                                Ok(Value::Text(jv.json_type_name().to_string()))
+                            }
+                        }
+                        None => Ok(Value::Null),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "JSON_ARRAY" => {
+            let mut items = Vec::new();
+            for arg in args {
+                let val = eval_expr_dynamic(arg, row, col_names)?;
+                items.push(json::sql_value_to_json(&val));
+            }
+            let arr = json::JsonValue::Array(items);
+            Ok(Value::Text(arr.to_json_string()))
+        }
+        "JSON_OBJECT" => {
+            if args.len() % 2 != 0 {
+                return Err(HorizonError::InvalidSql(
+                    "JSON_OBJECT requires an even number of arguments".into(),
+                ));
+            }
+            let mut pairs = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                let key_val = eval_expr_dynamic(&args[i], row, col_names)?;
+                let val_val = eval_expr_dynamic(&args[i + 1], row, col_names)?;
+                let key = match key_val {
+                    Value::Text(s) => s,
+                    Value::Integer(n) => n.to_string(),
+                    Value::Real(r) => r.to_string(),
+                    Value::Null => "null".to_string(),
+                    Value::Blob(_) => return Err(HorizonError::InvalidSql("JSON_OBJECT keys must be text".into())),
+                };
+                pairs.push((key, json::sql_value_to_json(&val_val)));
+                i += 2;
+            }
+            let obj = json::JsonValue::Object(pairs);
+            Ok(Value::Text(obj.to_json_string()))
+        }
+        "JSON_ARRAY_LENGTH" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let json_val = eval_expr_dynamic(&args[0], row, col_names)?;
+            match json_val {
+                Value::Text(s) => {
+                    match json::JsonParser::parse(&s) {
+                        Some(jv) => {
+                            let target = if args.len() >= 2 {
+                                let path_val = eval_expr_dynamic(&args[1], row, col_names)?;
+                                if let Value::Text(path) = path_val {
+                                    match jv.extract_path(&path) {
+                                        Some(v) => v.clone(),
+                                        None => return Ok(Value::Null),
+                                    }
+                                } else {
+                                    jv
+                                }
+                            } else {
+                                jv
+                            };
+                            match target.array_length() {
+                                Some(len) => Ok(Value::Integer(len as i64)),
+                                None => Ok(Value::Null),
+                            }
+                        }
+                        None => Ok(Value::Null),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "JSON_VALID" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr_dynamic(&args[0], row, col_names)?;
+            match val {
+                Value::Text(s) => {
+                    Ok(Value::Integer(if json::JsonParser::parse(&s).is_some() { 1 } else { 0 }))
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Integer(0)),
+            }
+        }
+        // -- Additional utility functions --
+        "PRINTF" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let fmt_val = eval_expr_dynamic(&args[0], row, col_names)?;
+            let fmt_str = match fmt_val {
+                Value::Text(s) => s,
+                _ => return Ok(Value::Null),
+            };
+            // Simplified PRINTF: supports %d, %f, %s, %%
+            let mut result = String::new();
+            let chars: Vec<char> = fmt_str.chars().collect();
+            let mut ci = 0;
+            let mut arg_idx = 1;
+            while ci < chars.len() {
+                if chars[ci] == '%' && ci + 1 < chars.len() {
+                    ci += 1;
+                    match chars[ci] {
+                        '%' => { result.push('%'); ci += 1; }
+                        'd' | 'i' => {
+                            if arg_idx < args.len() {
+                                let v = eval_expr_dynamic(&args[arg_idx], row, col_names)?;
+                                arg_idx += 1;
+                                match v {
+                                    Value::Integer(i) => result.push_str(&i.to_string()),
+                                    Value::Real(r) => result.push_str(&(r as i64).to_string()),
+                                    _ => result.push_str("0"),
+                                }
+                            }
+                            ci += 1;
+                        }
+                        'f' => {
+                            if arg_idx < args.len() {
+                                let v = eval_expr_dynamic(&args[arg_idx], row, col_names)?;
+                                arg_idx += 1;
+                                match v {
+                                    Value::Real(r) => result.push_str(&format!("{:.6}", r)),
+                                    Value::Integer(i) => result.push_str(&format!("{:.6}", i as f64)),
+                                    _ => result.push_str("0.000000"),
+                                }
+                            }
+                            ci += 1;
+                        }
+                        's' => {
+                            if arg_idx < args.len() {
+                                let v = eval_expr_dynamic(&args[arg_idx], row, col_names)?;
+                                arg_idx += 1;
+                                match v {
+                                    Value::Text(s) => result.push_str(&s),
+                                    Value::Integer(i) => result.push_str(&i.to_string()),
+                                    Value::Real(r) => result.push_str(&r.to_string()),
+                                    Value::Null => result.push_str("NULL"),
+                                    Value::Blob(_) => result.push_str("(blob)"),
+                                }
+                            }
+                            ci += 1;
+                        }
+                        _ => {
+                            result.push('%');
+                            result.push(chars[ci]);
+                            ci += 1;
+                        }
+                    }
+                } else {
+                    result.push(chars[ci]);
+                    ci += 1;
+                }
+            }
+            Ok(Value::Text(result))
+        }
+        "QUOTE" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr_dynamic(&args[0], row, col_names)?;
+            Ok(Value::Text(quote_value(&val)))
+        }
+        "UNICODE" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr_dynamic(&args[0], row, col_names)?;
+            match val {
+                Value::Text(s) => {
+                    match s.chars().next() {
+                        Some(c) => Ok(Value::Integer(c as i64)),
+                        None => Ok(Value::Null),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "CHAR" => {
+            let mut result = String::new();
+            for arg in args {
+                let val = eval_expr_dynamic(arg, row, col_names)?;
+                if let Value::Integer(code) = val {
+                    if let Some(c) = char::from_u32(code as u32) {
+                        result.push(c);
+                    }
+                }
+            }
+            Ok(Value::Text(result))
+        }
         _ => Err(HorizonError::NotImplemented(format!("function: {}", name))),
+    }
+}
+
+/// Return the SQL literal representation of a value (used by QUOTE function).
+fn quote_value(val: &Value) -> String {
+    match val {
+        Value::Null => "NULL".to_string(),
+        Value::Integer(i) => i.to_string(),
+        Value::Real(r) => {
+            if r.fract() == 0.0 && r.is_finite() {
+                format!("{:.1}", r)
+            } else {
+                r.to_string()
+            }
+        }
+        Value::Text(s) => {
+            // SQL string literal: single-quote delimited, escape ' as ''
+            let escaped = s.replace('\'', "''");
+            format!("'{}'", escaped)
+        }
+        Value::Blob(b) => {
+            let hex: String = b.iter().map(|byte| format!("{:02X}", byte)).collect();
+            format!("X'{}'", hex)
+        }
     }
 }
 
@@ -1385,6 +2285,59 @@ fn eval_aggregate_expr(
                         });
                     }
                     Ok(max_val.unwrap_or(Value::Null))
+                }
+                "GROUP_CONCAT" => {
+                    if args.is_empty() {
+                        return Ok(Value::Null);
+                    }
+                    let separator = if args.len() >= 2 {
+                        let sep_val = eval_expr_dynamic(&args[1], &group[0], col_names)?;
+                        match sep_val {
+                            Value::Text(s) => s,
+                            _ => ",".to_string(),
+                        }
+                    } else {
+                        ",".to_string()
+                    };
+                    let mut parts = Vec::new();
+                    for row in group {
+                        let val = eval_expr_dynamic(&args[0], row, col_names)?;
+                        if !val.is_null() {
+                            let s = match &val {
+                                Value::Text(s) => s.clone(),
+                                Value::Integer(i) => i.to_string(),
+                                Value::Real(r) => {
+                                    if r.fract() == 0.0 && r.is_finite() {
+                                        format!("{:.1}", r)
+                                    } else {
+                                        r.to_string()
+                                    }
+                                }
+                                _ => format!("{}", val),
+                            };
+                            parts.push(s);
+                        }
+                    }
+                    if parts.is_empty() {
+                        Ok(Value::Null)
+                    } else {
+                        Ok(Value::Text(parts.join(&separator)))
+                    }
+                }
+                "TOTAL" => {
+                    if args.is_empty() {
+                        return Ok(Value::Real(0.0));
+                    }
+                    let mut sum: f64 = 0.0;
+                    for row in group {
+                        let val = eval_expr_dynamic(&args[0], row, col_names)?;
+                        match val {
+                            Value::Integer(i) => sum += i as f64,
+                            Value::Real(r) => sum += r,
+                            _ => {}
+                        }
+                    }
+                    Ok(Value::Real(sum))
                 }
                 // Non-aggregate functions: evaluate on representative row
                 _ => eval_function_dynamic(name, args, representative, col_names),
@@ -1812,6 +2765,297 @@ fn execute_delete(
     }
 
     Ok(deleted)
+}
+
+// ---- INSERT/UPDATE/DELETE with RETURNING ----
+
+/// Execute an INSERT with RETURNING clause, returning the inserted rows.
+fn execute_insert_returning(
+    ins: &InsertStatement,
+    pool: &mut BufferPool,
+    catalog: &mut Catalog,
+    txn_mgr: &mut TransactionManager,
+) -> Result<QueryResult> {
+    let returning_cols = ins.returning.as_ref().unwrap();
+    let table = catalog.get_table(&ins.table)?.clone();
+
+    // Resolve output column names from the RETURNING clause
+    let column_names = resolve_column_names(returning_cols, &table)?;
+    let columns = Arc::new(column_names);
+
+    let mut rows = Vec::new();
+
+    // Execute the insert normally first (we re-use the insert logic)
+    let mut tree = BTree::open(table.root_page);
+    let mut next_rowid = table.next_rowid;
+    let _txn_id = txn_mgr.auto_commit();
+
+    for value_row in &ins.values {
+        let col_order: Vec<usize> = if let Some(ref col_names) = ins.columns {
+            col_names
+                .iter()
+                .map(|name| {
+                    table.find_column_index(name).ok_or_else(|| {
+                        HorizonError::ColumnNotFound(format!("{}.{}", ins.table, name))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            (0..table.columns.len()).collect()
+        };
+
+        if value_row.len() != col_order.len() {
+            return Err(HorizonError::InvalidSql(format!(
+                "expected {} values but got {}",
+                col_order.len(),
+                value_row.len()
+            )));
+        }
+
+        let mut row_values = vec![Value::Null; table.columns.len()];
+        for (val_idx, &col_idx) in col_order.iter().enumerate() {
+            let val = eval_expr(&value_row[val_idx], &[], &[], &table)?;
+            let affinity = table.columns[col_idx].affinity;
+            row_values[col_idx] = val.apply_affinity(affinity);
+        }
+
+        for (i, col) in table.columns.iter().enumerate() {
+            if !col_order.contains(&i) {
+                if let Some(ref default_val) = col.default_value {
+                    row_values[i] = default_val.clone();
+                }
+            }
+        }
+
+        let rowid = if let Some(pk_idx) = table.pk_column {
+            if table.columns[pk_idx].affinity == DataType::Integer {
+                match &row_values[pk_idx] {
+                    Value::Null => {
+                        let id = next_rowid;
+                        row_values[pk_idx] = Value::Integer(id);
+                        next_rowid = id + 1;
+                        id
+                    }
+                    Value::Integer(id) => {
+                        if *id >= next_rowid {
+                            next_rowid = *id + 1;
+                        }
+                        *id
+                    }
+                    _ => {
+                        let id = next_rowid;
+                        next_rowid = id + 1;
+                        id
+                    }
+                }
+            } else {
+                let id = next_rowid;
+                next_rowid = id + 1;
+                id
+            }
+        } else {
+            let id = next_rowid;
+            next_rowid = id + 1;
+            id
+        };
+
+        for (i, col) in table.columns.iter().enumerate() {
+            if col.not_null && row_values[i].is_null() {
+                return Err(HorizonError::ConstraintViolation(format!(
+                    "NOT NULL constraint failed: {}.{}",
+                    ins.table, col.name
+                )));
+            }
+        }
+
+        let key = rowid.to_be_bytes();
+        let existing = tree.search(pool, &key)?;
+        if let Some(ref old_value) = existing {
+            if ins.or_replace {
+                txn_mgr.record_undo(UndoEntry::Update {
+                    table: ins.table.clone(),
+                    root_page: tree.root_page(),
+                    key: key.to_vec(),
+                    old_value: old_value.clone(),
+                });
+            } else {
+                return Err(HorizonError::ConstraintViolation(format!(
+                    "UNIQUE constraint failed: {}.rowid",
+                    ins.table
+                )));
+            }
+        } else {
+            txn_mgr.record_undo(UndoEntry::Insert {
+                table: ins.table.clone(),
+                root_page: tree.root_page(),
+                key: key.to_vec(),
+            });
+        }
+
+        let row_data = serialize_row(&row_values);
+        tree.insert(pool, &key, &row_data)?;
+
+        // Project the RETURNING columns from the inserted row
+        let projected = project_row_returning(returning_cols, &row_values, &table)?;
+        rows.push(Row {
+            columns: columns.clone(),
+            values: projected,
+        });
+    }
+
+    // Update catalog metadata
+    let mut updated_table = catalog.get_table(&ins.table)?.clone();
+    updated_table.next_rowid = next_rowid;
+    if tree.root_page() != updated_table.root_page {
+        updated_table.root_page = tree.root_page();
+    }
+    catalog.update_table_meta(pool, &ins.table, &updated_table)?;
+
+    Ok(QueryResult { columns, rows })
+}
+
+/// Execute an UPDATE with RETURNING clause, returning the updated rows.
+fn execute_update_returning(
+    upd: &UpdateStatement,
+    pool: &mut BufferPool,
+    catalog: &mut Catalog,
+    txn_mgr: &mut TransactionManager,
+) -> Result<QueryResult> {
+    let returning_cols = upd.returning.as_ref().unwrap();
+    let table = catalog.get_table(&upd.table)?.clone();
+    let mut tree = BTree::open(table.root_page);
+
+    let column_names = resolve_column_names(returning_cols, &table)?;
+    let columns = Arc::new(column_names);
+
+    let entries = tree.scan_all(pool)?;
+    let mut rows = Vec::new();
+
+    for entry in &entries {
+        let mut row_values = deserialize_row(&entry.value, table.columns.len())?;
+
+        if let Some(ref where_clause) = upd.where_clause {
+            let result = eval_expr(where_clause, &row_values, &table.columns, &table)?;
+            if !result.to_bool() {
+                continue;
+            }
+        }
+
+        txn_mgr.record_undo(UndoEntry::Update {
+            table: upd.table.clone(),
+            root_page: tree.root_page(),
+            key: entry.key.clone(),
+            old_value: entry.value.clone(),
+        });
+
+        for (col_name, expr) in &upd.assignments {
+            let col_idx = table.find_column_index(col_name).ok_or_else(|| {
+                HorizonError::ColumnNotFound(format!("{}.{}", upd.table, col_name))
+            })?;
+            let new_val = eval_expr(expr, &row_values, &table.columns, &table)?;
+            let affinity = table.columns[col_idx].affinity;
+            row_values[col_idx] = new_val.apply_affinity(affinity);
+        }
+
+        let row_data = serialize_row(&row_values);
+        tree.insert(pool, &entry.key, &row_data)?;
+
+        // Project the RETURNING columns from the updated row
+        let projected = project_row_returning(returning_cols, &row_values, &table)?;
+        rows.push(Row {
+            columns: columns.clone(),
+            values: projected,
+        });
+    }
+
+    if tree.root_page() != table.root_page {
+        let mut updated_table = table.clone();
+        updated_table.root_page = tree.root_page();
+        catalog.update_table_meta(pool, &upd.table, &updated_table)?;
+    }
+
+    Ok(QueryResult { columns, rows })
+}
+
+/// Execute a DELETE with RETURNING clause, returning the deleted rows.
+fn execute_delete_returning(
+    del: &DeleteStatement,
+    pool: &mut BufferPool,
+    catalog: &mut Catalog,
+    txn_mgr: &mut TransactionManager,
+) -> Result<QueryResult> {
+    let returning_cols = del.returning.as_ref().unwrap();
+    let table = catalog.get_table(&del.table)?.clone();
+    let mut tree = BTree::open(table.root_page);
+
+    let column_names = resolve_column_names(returning_cols, &table)?;
+    let columns = Arc::new(column_names);
+
+    let entries = tree.scan_all(pool)?;
+    let mut to_delete: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
+
+    for entry in &entries {
+        let row_values = deserialize_row(&entry.value, table.columns.len())?;
+        if let Some(ref where_clause) = del.where_clause {
+            let result = eval_expr(where_clause, &row_values, &table.columns, &table)?;
+            if !result.to_bool() {
+                continue;
+            }
+        }
+        to_delete.push((entry.key.clone(), row_values));
+    }
+
+    let mut rows = Vec::new();
+    for (key, row_values) in &to_delete {
+        // Project RETURNING columns BEFORE deleting
+        let projected = project_row_returning(returning_cols, row_values, &table)?;
+        rows.push(Row {
+            columns: columns.clone(),
+            values: projected,
+        });
+
+        // Find the serialized value for undo
+        let row_data = serialize_row(row_values);
+        txn_mgr.record_undo(UndoEntry::Delete {
+            table: del.table.clone(),
+            root_page: tree.root_page(),
+            key: key.clone(),
+            old_value: row_data,
+        });
+        tree.delete(pool, key)?;
+    }
+
+    if tree.root_page() != table.root_page {
+        let mut updated_table = table.clone();
+        updated_table.root_page = tree.root_page();
+        catalog.update_table_meta(pool, &del.table, &updated_table)?;
+    }
+
+    Ok(QueryResult { columns, rows })
+}
+
+/// Project a row for RETURNING clause evaluation.
+fn project_row_returning(
+    select_cols: &[SelectColumn],
+    row: &[Value],
+    table: &TableInfo,
+) -> Result<Vec<Value>> {
+    let mut values = Vec::new();
+    for col in select_cols {
+        match col {
+            SelectColumn::AllColumns => {
+                values.extend(row.iter().cloned());
+            }
+            SelectColumn::TableAllColumns(_) => {
+                values.extend(row.iter().cloned());
+            }
+            SelectColumn::Expr { expr, .. } => {
+                let val = eval_expr(expr, row, &table.columns, table)?;
+                values.push(val);
+            }
+        }
+    }
+    Ok(values)
 }
 
 // ---- CREATE INDEX ----
@@ -2404,6 +3648,11 @@ fn eval_expr(
             // Subqueries require pool/catalog context; use eval_expr_with_ctx instead
             Err(HorizonError::NotImplemented("subqueries in expressions (use eval_expr_with_ctx)".into()))
         }
+        Expr::WindowFunction { .. } => {
+            Err(HorizonError::Internal(
+                "window functions must be evaluated via the window execution path".into(),
+            ))
+        }
     }
 }
 
@@ -2462,7 +3711,53 @@ fn eval_expr_with_ctx(
             let is_null = val.is_null();
             Ok(Value::Integer(if is_null != *negated { 1 } else { 0 }))
         }
-        // For expressions that don't contain subqueries (literals, columns, etc.),
+        Expr::InList { expr: inner, list, negated } => {
+            let val = eval_expr_with_ctx(inner, row, columns, table, pool, catalog)?;
+            // Check if the list contains a subquery (parser produces a single
+            // Expr::Subquery item for `IN (SELECT ...)`)
+            if list.len() == 1 {
+                if let Expr::Subquery(subquery) = &list[0] {
+                    let result = execute_select(subquery, pool, catalog)?;
+                    let mut found = false;
+                    for sub_row in &result.rows {
+                        if let Some(sub_val) = sub_row.values.first() {
+                            if val == *sub_val {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    return Ok(Value::Integer(if found != *negated { 1 } else { 0 }));
+                }
+            }
+            // Regular literal list
+            let mut found = false;
+            for item in list {
+                let item_val = eval_expr_with_ctx(item, row, columns, table, pool, catalog)?;
+                if val == item_val {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(Value::Integer(if found != *negated { 1 } else { 0 }))
+        }
+        Expr::Between { expr: inner, low, high, negated } => {
+            let val = eval_expr_with_ctx(inner, row, columns, table, pool, catalog)?;
+            let lo = eval_expr_with_ctx(low, row, columns, table, pool, catalog)?;
+            let hi = eval_expr_with_ctx(high, row, columns, table, pool, catalog)?;
+            let in_range = val >= lo && val <= hi;
+            Ok(Value::Integer(if in_range != *negated { 1 } else { 0 }))
+        }
+        Expr::Like { expr: inner, pattern, negated } => {
+            let val = eval_expr_with_ctx(inner, row, columns, table, pool, catalog)?;
+            let pat = eval_expr_with_ctx(pattern, row, columns, table, pool, catalog)?;
+            let matches = match (&val, &pat) {
+                (Value::Text(s), Value::Text(p)) => sql_like_match(s, p),
+                _ => false,
+            };
+            Ok(Value::Integer(if matches != *negated { 1 } else { 0 }))
+        }
+        // For expressions that don't contain subqueries (literals, columns, functions, casts, etc.),
         // fall through to the regular eval_expr
         _ => eval_expr(expr, row, columns, table),
     }
@@ -2520,6 +3815,52 @@ fn eval_expr_dynamic_with_ctx(
             let val = eval_expr_dynamic_with_ctx(inner, row, col_names, pool, catalog)?;
             let is_null = val.is_null();
             Ok(Value::Integer(if is_null != *negated { 1 } else { 0 }))
+        }
+        Expr::InList { expr: inner, list, negated } => {
+            let val = eval_expr_dynamic_with_ctx(inner, row, col_names, pool, catalog)?;
+            // Check if the list contains a subquery (parser produces a single
+            // Expr::Subquery item for `IN (SELECT ...)`)
+            if list.len() == 1 {
+                if let Expr::Subquery(subquery) = &list[0] {
+                    let result = execute_select(subquery, pool, catalog)?;
+                    let mut found = false;
+                    for sub_row in &result.rows {
+                        if let Some(sub_val) = sub_row.values.first() {
+                            if val == *sub_val {
+                                found = true;
+                                break;
+                            }
+                        }
+                    }
+                    return Ok(Value::Integer(if found != *negated { 1 } else { 0 }));
+                }
+            }
+            // Regular literal list
+            let mut found = false;
+            for item in list {
+                let item_val = eval_expr_dynamic_with_ctx(item, row, col_names, pool, catalog)?;
+                if val == item_val {
+                    found = true;
+                    break;
+                }
+            }
+            Ok(Value::Integer(if found != *negated { 1 } else { 0 }))
+        }
+        Expr::Between { expr: inner, low, high, negated } => {
+            let val = eval_expr_dynamic_with_ctx(inner, row, col_names, pool, catalog)?;
+            let lo = eval_expr_dynamic_with_ctx(low, row, col_names, pool, catalog)?;
+            let hi = eval_expr_dynamic_with_ctx(high, row, col_names, pool, catalog)?;
+            let in_range = val >= lo && val <= hi;
+            Ok(Value::Integer(if in_range != *negated { 1 } else { 0 }))
+        }
+        Expr::Like { expr: inner, pattern, negated } => {
+            let val = eval_expr_dynamic_with_ctx(inner, row, col_names, pool, catalog)?;
+            let pat = eval_expr_dynamic_with_ctx(pattern, row, col_names, pool, catalog)?;
+            let matches = match (&val, &pat) {
+                (Value::Text(s), Value::Text(p)) => sql_like_match(s, p),
+                _ => false,
+            };
+            Ok(Value::Integer(if matches != *negated { 1 } else { 0 }))
         }
         _ => eval_expr_dynamic(expr, row, col_names),
     }
@@ -2931,6 +4272,243 @@ fn eval_function(
             } else {
                 eval_expr(&args[2], row, columns, table)
             }
+        }
+        // -- JSON functions --
+        "JSON" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr(&args[0], row, columns, table)?;
+            match val {
+                Value::Text(s) => {
+                    match json::JsonParser::parse(&s) {
+                        Some(jv) => Ok(Value::Text(jv.to_json_string())),
+                        None => Err(HorizonError::InvalidSql("malformed JSON".into())),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Err(HorizonError::InvalidSql("JSON() requires a text argument".into())),
+            }
+        }
+        "JSON_EXTRACT" => {
+            if args.len() < 2 { return Ok(Value::Null); }
+            let json_val = eval_expr(&args[0], row, columns, table)?;
+            let path_val = eval_expr(&args[1], row, columns, table)?;
+            match (json_val, path_val) {
+                (Value::Text(s), Value::Text(path)) => {
+                    match json::JsonParser::parse(&s) {
+                        Some(jv) => {
+                            match jv.extract_path(&path) {
+                                Some(extracted) => Ok(json::json_value_to_sql(extracted)),
+                                None => Ok(Value::Null),
+                            }
+                        }
+                        None => Ok(Value::Null),
+                    }
+                }
+                _ => Ok(Value::Null),
+            }
+        }
+        "JSON_TYPE" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let json_val = eval_expr(&args[0], row, columns, table)?;
+            match json_val {
+                Value::Text(s) => {
+                    match json::JsonParser::parse(&s) {
+                        Some(jv) => {
+                            if args.len() >= 2 {
+                                let path_val = eval_expr(&args[1], row, columns, table)?;
+                                if let Value::Text(path) = path_val {
+                                    match jv.extract_path(&path) {
+                                        Some(extracted) => Ok(Value::Text(extracted.json_type_name().to_string())),
+                                        None => Ok(Value::Null),
+                                    }
+                                } else {
+                                    Ok(Value::Null)
+                                }
+                            } else {
+                                Ok(Value::Text(jv.json_type_name().to_string()))
+                            }
+                        }
+                        None => Ok(Value::Null),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "JSON_ARRAY" => {
+            let mut items = Vec::new();
+            for arg in args {
+                let val = eval_expr(arg, row, columns, table)?;
+                items.push(json::sql_value_to_json(&val));
+            }
+            let arr = json::JsonValue::Array(items);
+            Ok(Value::Text(arr.to_json_string()))
+        }
+        "JSON_OBJECT" => {
+            if args.len() % 2 != 0 {
+                return Err(HorizonError::InvalidSql(
+                    "JSON_OBJECT requires an even number of arguments".into(),
+                ));
+            }
+            let mut pairs = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                let key_val = eval_expr(&args[i], row, columns, table)?;
+                let val_val = eval_expr(&args[i + 1], row, columns, table)?;
+                let key = match key_val {
+                    Value::Text(s) => s,
+                    Value::Integer(n) => n.to_string(),
+                    Value::Real(r) => r.to_string(),
+                    Value::Null => "null".to_string(),
+                    Value::Blob(_) => return Err(HorizonError::InvalidSql("JSON_OBJECT keys must be text".into())),
+                };
+                pairs.push((key, json::sql_value_to_json(&val_val)));
+                i += 2;
+            }
+            let obj = json::JsonValue::Object(pairs);
+            Ok(Value::Text(obj.to_json_string()))
+        }
+        "JSON_ARRAY_LENGTH" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let json_val = eval_expr(&args[0], row, columns, table)?;
+            match json_val {
+                Value::Text(s) => {
+                    match json::JsonParser::parse(&s) {
+                        Some(jv) => {
+                            let target = if args.len() >= 2 {
+                                let path_val = eval_expr(&args[1], row, columns, table)?;
+                                if let Value::Text(path) = path_val {
+                                    match jv.extract_path(&path) {
+                                        Some(v) => v.clone(),
+                                        None => return Ok(Value::Null),
+                                    }
+                                } else {
+                                    jv
+                                }
+                            } else {
+                                jv
+                            };
+                            match target.array_length() {
+                                Some(len) => Ok(Value::Integer(len as i64)),
+                                None => Ok(Value::Null),
+                            }
+                        }
+                        None => Ok(Value::Null),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "JSON_VALID" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr(&args[0], row, columns, table)?;
+            match val {
+                Value::Text(s) => {
+                    Ok(Value::Integer(if json::JsonParser::parse(&s).is_some() { 1 } else { 0 }))
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Integer(0)),
+            }
+        }
+        // -- Additional utility functions --
+        "PRINTF" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let fmt_val = eval_expr(&args[0], row, columns, table)?;
+            let fmt_str = match fmt_val {
+                Value::Text(s) => s,
+                _ => return Ok(Value::Null),
+            };
+            let mut result = String::new();
+            let chars: Vec<char> = fmt_str.chars().collect();
+            let mut ci = 0;
+            let mut arg_idx = 1;
+            while ci < chars.len() {
+                if chars[ci] == '%' && ci + 1 < chars.len() {
+                    ci += 1;
+                    match chars[ci] {
+                        '%' => { result.push('%'); ci += 1; }
+                        'd' | 'i' => {
+                            if arg_idx < args.len() {
+                                let v = eval_expr(&args[arg_idx], row, columns, table)?;
+                                arg_idx += 1;
+                                match v {
+                                    Value::Integer(i) => result.push_str(&i.to_string()),
+                                    Value::Real(r) => result.push_str(&(r as i64).to_string()),
+                                    _ => result.push_str("0"),
+                                }
+                            }
+                            ci += 1;
+                        }
+                        'f' => {
+                            if arg_idx < args.len() {
+                                let v = eval_expr(&args[arg_idx], row, columns, table)?;
+                                arg_idx += 1;
+                                match v {
+                                    Value::Real(r) => result.push_str(&format!("{:.6}", r)),
+                                    Value::Integer(i) => result.push_str(&format!("{:.6}", i as f64)),
+                                    _ => result.push_str("0.000000"),
+                                }
+                            }
+                            ci += 1;
+                        }
+                        's' => {
+                            if arg_idx < args.len() {
+                                let v = eval_expr(&args[arg_idx], row, columns, table)?;
+                                arg_idx += 1;
+                                match v {
+                                    Value::Text(s) => result.push_str(&s),
+                                    Value::Integer(i) => result.push_str(&i.to_string()),
+                                    Value::Real(r) => result.push_str(&r.to_string()),
+                                    Value::Null => result.push_str("NULL"),
+                                    Value::Blob(_) => result.push_str("(blob)"),
+                                }
+                            }
+                            ci += 1;
+                        }
+                        _ => {
+                            result.push('%');
+                            result.push(chars[ci]);
+                            ci += 1;
+                        }
+                    }
+                } else {
+                    result.push(chars[ci]);
+                    ci += 1;
+                }
+            }
+            Ok(Value::Text(result))
+        }
+        "QUOTE" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr(&args[0], row, columns, table)?;
+            Ok(Value::Text(quote_value(&val)))
+        }
+        "UNICODE" => {
+            if args.is_empty() { return Ok(Value::Null); }
+            let val = eval_expr(&args[0], row, columns, table)?;
+            match val {
+                Value::Text(s) => {
+                    match s.chars().next() {
+                        Some(c) => Ok(Value::Integer(c as i64)),
+                        None => Ok(Value::Null),
+                    }
+                }
+                Value::Null => Ok(Value::Null),
+                _ => Ok(Value::Null),
+            }
+        }
+        "CHAR" => {
+            let mut result = String::new();
+            for arg in args {
+                let val = eval_expr(arg, row, columns, table)?;
+                if let Value::Integer(code) = val {
+                    if let Some(c) = char::from_u32(code as u32) {
+                        result.push(c);
+                    }
+                }
+            }
+            Ok(Value::Text(result))
         }
         _ => Err(HorizonError::NotImplemented(format!("function: {}", name))),
     }

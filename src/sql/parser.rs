@@ -472,6 +472,16 @@ impl Parser {
         }
     }
 
+    /// Parse an optional RETURNING clause: `RETURNING col1, col2, ...`.
+    fn parse_optional_returning(&mut self) -> Result<Option<Vec<SelectColumn>>> {
+        if self.current() == &Token::Returning {
+            self.advance();
+            Ok(Some(self.parse_select_columns()?))
+        } else {
+            Ok(None)
+        }
+    }
+
     // =======================================================================
     // FROM clause + JOINs
     // =======================================================================
@@ -616,11 +626,14 @@ impl Parser {
             values.push(self.parse_value_row()?);
         }
 
+        let returning = self.parse_optional_returning()?;
+
         Ok(Statement::Insert(InsertStatement {
             table,
             columns,
             values,
             or_replace,
+            returning,
         }))
     }
 
@@ -662,10 +675,13 @@ impl Parser {
             None
         };
 
+        let returning = self.parse_optional_returning()?;
+
         Ok(Statement::Update(UpdateStatement {
             table,
             assignments,
             where_clause,
+            returning,
         }))
     }
 
@@ -692,9 +708,12 @@ impl Parser {
             None
         };
 
+        let returning = self.parse_optional_returning()?;
+
         Ok(Statement::Delete(DeleteStatement {
             table,
             where_clause,
+            returning,
         }))
     }
 
@@ -1350,13 +1369,24 @@ impl Parser {
                             self.advance(); // NOT
                             self.advance(); // IN
                             self.expect(&Token::LeftParen)?;
-                            let list = self.parse_expr_list()?;
-                            self.expect(&Token::RightParen)?;
-                            left = Expr::InList {
-                                expr: Box::new(left),
-                                list,
-                                negated: true,
-                            };
+                            // Check for subquery
+                            if self.current() == &Token::Select {
+                                let query = self.parse_select_full()?;
+                                self.expect(&Token::RightParen)?;
+                                left = Expr::InList {
+                                    expr: Box::new(left),
+                                    list: vec![Expr::Subquery(Box::new(query))],
+                                    negated: true,
+                                };
+                            } else {
+                                let list = self.parse_expr_list()?;
+                                self.expect(&Token::RightParen)?;
+                                left = Expr::InList {
+                                    expr: Box::new(left),
+                                    list,
+                                    negated: true,
+                                };
+                            }
                         }
                         Token::Like => {
                             self.advance(); // NOT
@@ -1714,11 +1744,16 @@ impl Parser {
                         self.parse_expr_list()?
                     };
                     self.expect(&Token::RightParen)?;
-                    return Ok(Expr::Function {
+                    let func = Expr::Function {
                         name: name.to_ascii_uppercase(),
                         args,
                         distinct,
-                    });
+                    };
+                    // Check for OVER (...) to make this a window function
+                    if self.current() == &Token::Over {
+                        return self.parse_window_function(func);
+                    }
+                    return Ok(func);
                 }
                 // Qualified column: table.column
                 if self.current() == &Token::Dot {
@@ -1764,6 +1799,122 @@ impl Parser {
                 "unexpected token in expression: {:?}",
                 self.current()
             ))),
+        }
+    }
+
+    // =======================================================================
+    // Window function parsing
+    // =======================================================================
+
+    /// Parse a window specification after a function call: `OVER (...)`.
+    fn parse_window_function(&mut self, func: Expr) -> Result<Expr> {
+        self.expect(&Token::Over)?;
+        self.expect(&Token::LeftParen)?;
+
+        // PARTITION BY expr_list (optional)
+        let partition_by = if self.current() == &Token::Partition {
+            self.advance();
+            self.expect(&Token::By)?;
+            self.parse_expr_list()?
+        } else {
+            vec![]
+        };
+
+        // ORDER BY order_list (optional)
+        let order_by = if self.current() == &Token::Order {
+            self.advance();
+            self.expect(&Token::By)?;
+            self.parse_order_by_list()?
+        } else {
+            vec![]
+        };
+
+        // Frame clause: ROWS|RANGE ... (optional)
+        let frame = if matches!(self.current(), Token::Rows | Token::Range) {
+            Some(self.parse_window_frame()?)
+        } else {
+            None
+        };
+
+        self.expect(&Token::RightParen)?;
+
+        Ok(Expr::WindowFunction {
+            function: Box::new(func),
+            partition_by,
+            order_by,
+            frame,
+        })
+    }
+
+    /// Parse a window frame clause: `ROWS|RANGE BETWEEN ... AND ...`
+    /// or `ROWS|RANGE <single-bound>`.
+    fn parse_window_frame(&mut self) -> Result<WindowFrame> {
+        let mode = if self.current() == &Token::Rows {
+            self.advance();
+            WindowFrameMode::Rows
+        } else {
+            self.advance(); // Token::Range
+            WindowFrameMode::Range
+        };
+
+        // Check for BETWEEN ... AND ... form
+        if self.current() == &Token::Between {
+            self.advance();
+            let start = self.parse_window_frame_bound()?;
+            self.expect(&Token::And)?;
+            let end = self.parse_window_frame_bound()?;
+            Ok(WindowFrame {
+                mode,
+                start,
+                end: Some(end),
+            })
+        } else {
+            // Single bound form (implicit end = CURRENT ROW)
+            let start = self.parse_window_frame_bound()?;
+            Ok(WindowFrame {
+                mode,
+                start,
+                end: None,
+            })
+        }
+    }
+
+    /// Parse a single window frame bound:
+    ///   CURRENT ROW | UNBOUNDED PRECEDING | UNBOUNDED FOLLOWING | expr PRECEDING | expr FOLLOWING
+    fn parse_window_frame_bound(&mut self) -> Result<WindowFrameBound> {
+        if self.current() == &Token::Current {
+            self.advance();
+            self.expect(&Token::Row)?;
+            Ok(WindowFrameBound::CurrentRow)
+        } else if self.current() == &Token::Unbounded {
+            self.advance();
+            if self.current() == &Token::Preceding {
+                self.advance();
+                Ok(WindowFrameBound::Preceding(None))
+            } else if self.current() == &Token::Following {
+                self.advance();
+                Ok(WindowFrameBound::Following(None))
+            } else {
+                Err(self.error(format!(
+                    "expected PRECEDING or FOLLOWING after UNBOUNDED, got {:?}",
+                    self.current()
+                )))
+            }
+        } else {
+            // expr PRECEDING | expr FOLLOWING
+            let expr = self.parse_expr()?;
+            if self.current() == &Token::Preceding {
+                self.advance();
+                Ok(WindowFrameBound::Preceding(Some(Box::new(expr))))
+            } else if self.current() == &Token::Following {
+                self.advance();
+                Ok(WindowFrameBound::Following(Some(Box::new(expr))))
+            } else {
+                Err(self.error(format!(
+                    "expected PRECEDING or FOLLOWING after expression in frame bound, got {:?}",
+                    self.current()
+                )))
+            }
         }
     }
 

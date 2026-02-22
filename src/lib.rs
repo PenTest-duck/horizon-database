@@ -147,15 +147,18 @@ impl Database {
 
         let DatabaseInner { buffer_pool, catalog, txn_manager } = &mut *inner;
 
-        // Route SELECT, PRAGMA, and EXPLAIN through execute_query
+        // Route SELECT, PRAGMA, EXPLAIN, and RETURNING through execute_query
         match &stmts[0] {
             sql::ast::Statement::Select(_)
             | sql::ast::Statement::Pragma(_)
             | sql::ast::Statement::Explain(_) => {
                 execution::execute_query(&stmts[0], buffer_pool, catalog, txn_manager)
             }
+            stmt if execution::has_returning(stmt) => {
+                execution::execute_query(stmt, buffer_pool, catalog, txn_manager)
+            }
             _ => Err(HorizonError::Internal(
-                "query() requires a SELECT, PRAGMA, or EXPLAIN statement".into(),
+                "query() requires a SELECT, PRAGMA, EXPLAIN, or RETURNING statement".into(),
             )),
         }
     }

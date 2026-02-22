@@ -134,6 +134,8 @@ pub struct InsertStatement {
     /// Multiple value rows: `VALUES (a, b), (c, d)`.
     pub values: Vec<Vec<Expr>>,
     pub or_replace: bool,
+    /// Optional `RETURNING` clause.
+    pub returning: Option<Vec<SelectColumn>>,
 }
 
 /// An `UPDATE` statement.
@@ -142,6 +144,8 @@ pub struct UpdateStatement {
     pub table: String,
     pub assignments: Vec<(String, Expr)>,
     pub where_clause: Option<Expr>,
+    /// Optional `RETURNING` clause.
+    pub returning: Option<Vec<SelectColumn>>,
 }
 
 /// A `DELETE` statement.
@@ -149,6 +153,8 @@ pub struct UpdateStatement {
 pub struct DeleteStatement {
     pub table: String,
     pub where_clause: Option<Expr>,
+    /// Optional `RETURNING` clause.
+    pub returning: Option<Vec<SelectColumn>>,
 }
 
 /// A `CREATE TABLE` statement.
@@ -328,6 +334,39 @@ pub enum Expr {
     Subquery(Box<SelectStatement>),
     Exists(Box<SelectStatement>),
     Placeholder(usize),
+    /// A window function call: `func(...) OVER (PARTITION BY ... ORDER BY ... frame)`.
+    WindowFunction {
+        function: Box<Expr>,
+        partition_by: Vec<Expr>,
+        order_by: Vec<OrderByItem>,
+        frame: Option<WindowFrame>,
+    },
+}
+
+/// The frame specification for a window function.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowFrame {
+    pub mode: WindowFrameMode,
+    pub start: WindowFrameBound,
+    pub end: Option<WindowFrameBound>,
+}
+
+/// Whether the window frame is row-based or range-based.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFrameMode {
+    Rows,
+    Range,
+}
+
+/// A single bound in a window frame clause.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WindowFrameBound {
+    /// `CURRENT ROW`
+    CurrentRow,
+    /// `[UNBOUNDED | expr] PRECEDING` -- `None` means UNBOUNDED.
+    Preceding(Option<Box<Expr>>),
+    /// `[UNBOUNDED | expr] FOLLOWING` -- `None` means UNBOUNDED.
+    Following(Option<Box<Expr>>),
 }
 
 /// A literal value.
