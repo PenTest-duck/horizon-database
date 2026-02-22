@@ -1,0 +1,35 @@
+[package]
+name = "horizon-db"
+version = "0.1.0"
+edition = "2021"
+description = "A highly-performant serverless RDBMS with SQLite feature parity"
+license = "MIT"
+rust-version = "1.70"
+
+[lib]
+name = "horizon"
+path = "src/lib.rs"
+
+[[bin]]
+name = "horizon"
+path = "src/cli/main.rs"
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+
+[profile.bench]
+inherits = "release"
+debug = true

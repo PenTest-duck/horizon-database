@@ -1,0 +1,9 @@
+/target
+*.hdb
+*.hdb-wal
+*.hdb-shm
+Cargo.lock
+*.swp
+*.swo
+*~
+.DS_Store
