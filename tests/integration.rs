@@ -3051,3 +3051,797 @@ fn in_subquery_with_where_in_subquery() {
     // Active categories are 1 (Electronics) and 3 (Clothing)
     assert_eq!(names, vec!["Laptop", "Phone", "Shirt"]);
 }
+
+// ====================================================================
+// Collation sequences
+// ====================================================================
+
+#[test]
+fn collate_column_definition() {
+    let (_dir, db) = open_db();
+    // COLLATE in column definition is parsed (doesn't error)
+    db.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)").unwrap();
+    db.execute("INSERT INTO test VALUES (1, 'Alice')").unwrap();
+    let result = db.query("SELECT name FROM test").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("Alice".to_string()));
+}
+
+// =====================================================================
+// Date/Time Functions
+// =====================================================================
+
+#[test]
+fn date_function_basic() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-03-15')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-03-15".to_string()));
+}
+
+#[test]
+fn date_function_from_datetime() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-03-15 14:30:00')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-03-15".to_string()));
+}
+
+#[test]
+fn time_function_basic() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT TIME('2024-03-15 14:30:45')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("14:30:45".to_string()));
+}
+
+#[test]
+fn time_function_date_only() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT TIME('2024-03-15')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("00:00:00".to_string()));
+}
+
+#[test]
+fn datetime_function_basic() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATETIME('2024-03-15 14:30:45')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-03-15 14:30:45".to_string()));
+}
+
+#[test]
+fn datetime_function_date_only() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATETIME('2024-03-15')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-03-15 00:00:00".to_string()));
+}
+
+#[test]
+fn date_with_add_days() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-03-15', '+10 days')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-03-25".to_string()));
+}
+
+#[test]
+fn date_with_subtract_days() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-03-15', '-20 days')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-02-24".to_string()));
+}
+
+#[test]
+fn date_with_add_months() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-01-31', '+1 months')").unwrap();
+    // January 31 + 1 month = February, but Feb only has 29 days in 2024 (leap year)
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-02-29".to_string()));
+}
+
+#[test]
+fn date_with_add_years() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-02-29', '+1 years')").unwrap();
+    // Feb 29 2024 + 1 year = 2025, which is not a leap year, so Feb 28
+    assert_eq!(result.rows[0].values[0], Value::Text("2025-02-28".to_string()));
+}
+
+#[test]
+fn date_start_of_month() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-03-15', 'start of month')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-03-01".to_string()));
+}
+
+#[test]
+fn date_start_of_year() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-07-20', 'start of year')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-01-01".to_string()));
+}
+
+#[test]
+fn datetime_start_of_day() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATETIME('2024-03-15 14:30:45', 'start of day')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-03-15 00:00:00".to_string()));
+}
+
+#[test]
+fn date_multiple_modifiers() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-01-15', '+1 months', '+5 days')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-02-20".to_string()));
+}
+
+#[test]
+fn date_now_returns_current_date() {
+    let (_dir, db) = open_db();
+    // Just verify it returns a valid date format (YYYY-MM-DD)
+    let result = db.query("SELECT DATE('now')").unwrap();
+    let val = &result.rows[0].values[0];
+    if let Value::Text(s) = val {
+        assert_eq!(s.len(), 10);
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+    } else {
+        panic!("Expected Text value from DATE('now')");
+    }
+}
+
+#[test]
+fn datetime_now_returns_current_datetime() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATETIME('now')").unwrap();
+    let val = &result.rows[0].values[0];
+    if let Value::Text(s) = val {
+        assert_eq!(s.len(), 19);
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+        assert_eq!(&s[10..11], " ");
+        assert_eq!(&s[13..14], ":");
+        assert_eq!(&s[16..17], ":");
+    } else {
+        panic!("Expected Text value from DATETIME('now')");
+    }
+}
+
+#[test]
+fn date_invalid_returns_null() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('not-a-date')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Null);
+}
+
+#[test]
+fn strftime_year_month_day() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT STRFTIME('%Y-%m-%d', '2024-03-15')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-03-15".to_string()));
+}
+
+#[test]
+fn strftime_custom_format() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT STRFTIME('%Y/%m/%d %H:%M', '2024-03-15 14:30:45')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024/03/15 14:30".to_string()));
+}
+
+#[test]
+fn strftime_day_of_year() {
+    let (_dir, db) = open_db();
+    // 2024-01-01 is day 001
+    let result = db.query("SELECT STRFTIME('%j', '2024-01-01')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("001".to_string()));
+
+    // 2024-03-01 = Jan(31) + Feb(29 in 2024) + 1 = day 061
+    let result = db.query("SELECT STRFTIME('%j', '2024-03-01')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("061".to_string()));
+}
+
+#[test]
+fn strftime_day_of_week() {
+    let (_dir, db) = open_db();
+    // 2024-03-15 is a Friday = 5
+    let result = db.query("SELECT STRFTIME('%w', '2024-03-15')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("5".to_string()));
+
+    // 2024-03-17 is a Sunday = 0
+    let result = db.query("SELECT STRFTIME('%w', '2024-03-17')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("0".to_string()));
+}
+
+#[test]
+fn strftime_with_modifier() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT STRFTIME('%Y-%m-%d', '2024-03-15', '+1 months')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-04-15".to_string()));
+}
+
+#[test]
+fn strftime_fractional_seconds() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT STRFTIME('%f', '2024-03-15 14:30:45.123')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("45.123".to_string()));
+}
+
+#[test]
+fn strftime_percent_escape() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT STRFTIME('%%Y', '2024-03-15')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("%Y".to_string()));
+}
+
+#[test]
+fn julianday_known_date() {
+    let (_dir, db) = open_db();
+    // Julian day for 2000-01-01 12:00:00 should be 2451545.0
+    let result = db.query("SELECT JULIANDAY('2000-01-01 12:00:00')").unwrap();
+    if let Value::Real(jd) = &result.rows[0].values[0] {
+        assert!((jd - 2451545.0).abs() < 0.001, "Julian day was {}", jd);
+    } else {
+        panic!("Expected Real value from JULIANDAY");
+    }
+}
+
+#[test]
+fn julianday_date_only() {
+    let (_dir, db) = open_db();
+    // Julian day for 2000-01-01 00:00:00 should be 2451544.5
+    let result = db.query("SELECT JULIANDAY('2000-01-01')").unwrap();
+    if let Value::Real(jd) = &result.rows[0].values[0] {
+        assert!((jd - 2451544.5).abs() < 0.001, "Julian day was {}", jd);
+    } else {
+        panic!("Expected Real value from JULIANDAY");
+    }
+}
+
+#[test]
+fn date_with_fractional_seconds() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-03-15 14:30:45.500')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-03-15".to_string()));
+}
+
+#[test]
+fn date_cross_month_boundary() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-01-31', '+1 days')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2024-02-01".to_string()));
+}
+
+#[test]
+fn date_cross_year_boundary() {
+    let (_dir, db) = open_db();
+    let result = db.query("SELECT DATE('2024-12-31', '+1 days')").unwrap();
+    assert_eq!(result.rows[0].values[0], Value::Text("2025-01-01".to_string()));
+}
+
+#[test]
+fn date_functions_in_table_context() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, event_date TEXT)").unwrap();
+    db.execute("INSERT INTO events VALUES (1, '2024-03-15')").unwrap();
+    db.execute("INSERT INTO events VALUES (2, '2024-06-20')").unwrap();
+
+    let result = db.query(
+        "SELECT id, DATE(event_date, '+30 days') FROM events ORDER BY id"
+    ).unwrap();
+    assert_eq!(result.rows[0].values[1], Value::Text("2024-04-14".to_string()));
+    assert_eq!(result.rows[1].values[1], Value::Text("2024-07-20".to_string()));
+}
+
+// =====================================================================
+// ATTACH / DETACH DATABASE
+// =====================================================================
+
+#[test]
+fn attach_database_basic() {
+    let (_dir, db) = open_db();
+    // Create a second database file to attach
+    let dir2 = tempfile::TempDir::new().unwrap();
+    let db2_path = dir2.path().join("other.hdb");
+    let _db2 = Database::open(&db2_path).unwrap();
+    let path_str = db2_path.to_str().unwrap();
+
+    db.execute(&format!("ATTACH DATABASE '{}' AS other_db", path_str)).unwrap();
+}
+
+#[test]
+fn detach_database_basic() {
+    let (_dir, db) = open_db();
+    let dir2 = tempfile::TempDir::new().unwrap();
+    let db2_path = dir2.path().join("other.hdb");
+    let _db2 = Database::open(&db2_path).unwrap();
+    let path_str = db2_path.to_str().unwrap();
+
+    db.execute(&format!("ATTACH DATABASE '{}' AS other_db", path_str)).unwrap();
+    db.execute("DETACH DATABASE other_db").unwrap();
+}
+
+#[test]
+fn detach_nonexistent_database_fails() {
+    let (_dir, db) = open_db();
+    let result = db.execute("DETACH DATABASE nonexistent");
+    assert!(result.is_err());
+}
+
+#[test]
+fn attach_reserved_name_fails() {
+    let (_dir, db) = open_db();
+    let result = db.execute("ATTACH DATABASE 'foo.hdb' AS main");
+    assert!(result.is_err());
+}
+
+#[test]
+fn attach_duplicate_name_fails() {
+    let (_dir, db) = open_db();
+    let dir2 = tempfile::TempDir::new().unwrap();
+    let db2_path = dir2.path().join("other.hdb");
+    let _db2 = Database::open(&db2_path).unwrap();
+    let path_str = db2_path.to_str().unwrap();
+
+    db.execute(&format!("ATTACH DATABASE '{}' AS mydb", path_str)).unwrap();
+    let result = db.execute(&format!("ATTACH DATABASE '{}' AS mydb", path_str));
+    assert!(result.is_err());
+}
+
+#[test]
+fn attach_without_database_keyword() {
+    let (_dir, db) = open_db();
+    let dir2 = tempfile::TempDir::new().unwrap();
+    let db2_path = dir2.path().join("other.hdb");
+    let _db2 = Database::open(&db2_path).unwrap();
+    let path_str = db2_path.to_str().unwrap();
+
+    // ATTACH without DATABASE keyword should also work
+    db.execute(&format!("ATTACH '{}' AS other_db", path_str)).unwrap();
+}
+
+#[test]
+fn detach_without_database_keyword() {
+    let (_dir, db) = open_db();
+    let dir2 = tempfile::TempDir::new().unwrap();
+    let db2_path = dir2.path().join("other.hdb");
+    let _db2 = Database::open(&db2_path).unwrap();
+    let path_str = db2_path.to_str().unwrap();
+
+    db.execute(&format!("ATTACH '{}' AS other_db", path_str)).unwrap();
+    // DETACH without DATABASE keyword should also work
+    db.execute("DETACH other_db").unwrap();
+}
+
+// ─── Generated Columns ───────────────────────────────────────────────
+
+#[test]
+fn generated_column_stored_basic() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE calc (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (3, 4)").unwrap();
+
+    let result = db.query("SELECT a, b, c FROM calc").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].get("a"), Some(&Value::Integer(3)));
+    assert_eq!(result.rows[0].get("b"), Some(&Value::Integer(4)));
+    assert_eq!(result.rows[0].get("c"), Some(&Value::Integer(7)));
+}
+
+#[test]
+fn generated_column_virtual_basic() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE calc (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a * b) VIRTUAL)").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (5, 6)").unwrap();
+
+    let result = db.query("SELECT a, b, c FROM calc").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].get("a"), Some(&Value::Integer(5)));
+    assert_eq!(result.rows[0].get("b"), Some(&Value::Integer(6)));
+    assert_eq!(result.rows[0].get("c"), Some(&Value::Integer(30)));
+}
+
+#[test]
+fn generated_column_select_star() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE calc (a INTEGER, b INTEGER, total INTEGER GENERATED ALWAYS AS (a + b) STORED)").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (10, 20)").unwrap();
+
+    let result = db.query("SELECT * FROM calc").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.columns.len(), 3);
+    assert_eq!(result.rows[0].values[2], Value::Integer(30));
+}
+
+#[test]
+fn generated_column_shorthand_syntax() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE calc (a INTEGER, b INTEGER, c INTEGER AS (a + b) STORED)").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (7, 8)").unwrap();
+
+    let result = db.query("SELECT c FROM calc").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Integer(15));
+}
+
+#[test]
+fn generated_column_virtual_default() {
+    let (_dir, db) = open_db();
+    // When neither STORED nor VIRTUAL is specified, default is VIRTUAL
+    db.execute("CREATE TABLE calc (a INTEGER, b INTEGER, c INTEGER AS (a + b))").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (1, 2)").unwrap();
+
+    let result = db.query("SELECT c FROM calc").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Integer(3));
+}
+
+#[test]
+fn generated_column_cannot_insert_directly() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE calc (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)").unwrap();
+
+    // Trying to insert into a generated column should fail
+    let result = db.execute("INSERT INTO calc (a, b, c) VALUES (1, 2, 3)");
+    assert!(result.is_err());
+}
+
+#[test]
+fn generated_column_where_clause() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE calc (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (1, 2)").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (10, 20)").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (100, 200)").unwrap();
+
+    let result = db.query("SELECT a, b, c FROM calc WHERE c > 5").unwrap();
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn generated_column_virtual_where_clause() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE calc (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a * b) VIRTUAL)").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (2, 3)").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (5, 10)").unwrap();
+    db.execute("INSERT INTO calc (a, b) VALUES (1, 1)").unwrap();
+
+    let result = db.query("SELECT a, b, c FROM calc WHERE c >= 6").unwrap();
+    assert_eq!(result.len(), 2);
+}
+
+#[test]
+fn generated_column_multiple_rows() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE calc (x INTEGER, doubled INTEGER GENERATED ALWAYS AS (x * 2) STORED)").unwrap();
+    db.execute("INSERT INTO calc (x) VALUES (1)").unwrap();
+    db.execute("INSERT INTO calc (x) VALUES (2)").unwrap();
+    db.execute("INSERT INTO calc (x) VALUES (3)").unwrap();
+    db.execute("INSERT INTO calc (x) VALUES (4)").unwrap();
+    db.execute("INSERT INTO calc (x) VALUES (5)").unwrap();
+
+    let result = db.query("SELECT x, doubled FROM calc ORDER BY x").unwrap();
+    assert_eq!(result.len(), 5);
+    for i in 0..5 {
+        let x = i as i64 + 1;
+        assert_eq!(result.rows[i].values[0], Value::Integer(x));
+        assert_eq!(result.rows[i].values[1], Value::Integer(x * 2));
+    }
+}
+
+#[test]
+fn generated_column_with_autoincrement_pk() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY AUTOINCREMENT, price REAL, tax REAL GENERATED ALWAYS AS (price * 0.1) STORED)").unwrap();
+    db.execute("INSERT INTO items (price) VALUES (100.0)").unwrap();
+    db.execute("INSERT INTO items (price) VALUES (200.0)").unwrap();
+
+    let result = db.query("SELECT id, price, tax FROM items ORDER BY id").unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.rows[0].values[0], Value::Integer(1));
+    assert_eq!(result.rows[1].values[0], Value::Integer(2));
+    // tax = price * 0.1
+    assert_eq!(result.rows[0].values[2], Value::Real(10.0));
+    assert_eq!(result.rows[1].values[2], Value::Real(20.0));
+}
+
+// ─── VACUUM ──────────────────────────────────────────────────────────
+
+#[test]
+fn vacuum_basic() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("INSERT INTO data VALUES (1, 'hello')").unwrap();
+    db.execute("INSERT INTO data VALUES (2, 'world')").unwrap();
+    db.execute("DELETE FROM data WHERE id = 1").unwrap();
+
+    // VACUUM should succeed
+    db.execute("VACUUM").unwrap();
+
+    // Remaining data should be intact
+    let result = db.query("SELECT * FROM data").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].values[0], Value::Integer(2));
+}
+
+#[test]
+fn vacuum_empty_database() {
+    let (_dir, db) = open_db();
+    // VACUUM on an empty database should succeed
+    db.execute("VACUUM").unwrap();
+}
+
+#[test]
+fn vacuum_preserves_data() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t2 (id INTEGER PRIMARY KEY, value REAL)").unwrap();
+    db.execute("INSERT INTO t1 VALUES (1, 'Alice')").unwrap();
+    db.execute("INSERT INTO t1 VALUES (2, 'Bob')").unwrap();
+    db.execute("INSERT INTO t2 VALUES (1, 3.14)").unwrap();
+
+    db.execute("VACUUM").unwrap();
+
+    let r1 = db.query("SELECT * FROM t1").unwrap();
+    assert_eq!(r1.len(), 2);
+    let r2 = db.query("SELECT * FROM t2").unwrap();
+    assert_eq!(r2.len(), 1);
+}
+
+#[test]
+fn vacuum_with_semicolon() {
+    let (_dir, db) = open_db();
+    db.execute("VACUUM;").unwrap();
+}
+
+
+// =========================================================================
+// View tests
+// =========================================================================
+
+#[test]
+fn create_view_and_select() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, dept TEXT, salary INTEGER)").unwrap();
+    db.execute("INSERT INTO employees VALUES (1, 'Alice', 'Engineering', 100000)").unwrap();
+    db.execute("INSERT INTO employees VALUES (2, 'Bob', 'Engineering', 90000)").unwrap();
+    db.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Sales', 80000)").unwrap();
+
+    db.execute("CREATE VIEW eng_employees AS SELECT id, name, salary FROM employees WHERE dept = 'Engineering'").unwrap();
+
+    let result = db.query("SELECT * FROM eng_employees").unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.columns.len(), 3);
+    assert_eq!(result.columns[0], "id");
+    assert_eq!(result.columns[1], "name");
+    assert_eq!(result.columns[2], "salary");
+}
+
+#[test]
+fn view_with_where_clause() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category TEXT)").unwrap();
+    db.execute("INSERT INTO products VALUES (1, 'Laptop', 999.99, 'Electronics')").unwrap();
+    db.execute("INSERT INTO products VALUES (2, 'Phone', 599.99, 'Electronics')").unwrap();
+    db.execute("INSERT INTO products VALUES (3, 'Desk', 299.99, 'Furniture')").unwrap();
+    db.execute("INSERT INTO products VALUES (4, 'Chair', 199.99, 'Furniture')").unwrap();
+
+    db.execute("CREATE VIEW electronics AS SELECT id, name, price FROM products WHERE category = 'Electronics'").unwrap();
+
+    let result = db.query("SELECT * FROM electronics WHERE price > 600.0").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].get("name"), Some(&Value::Text("Laptop".to_string())));
+}
+
+#[test]
+fn view_select_specific_columns() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER)").unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', 30)").unwrap();
+    db.execute("INSERT INTO users VALUES (2, 'Bob', 'bob@example.com', 25)").unwrap();
+
+    db.execute("CREATE VIEW user_names AS SELECT name, email FROM users").unwrap();
+
+    let result = db.query("SELECT name FROM user_names").unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.columns.len(), 1);
+    assert_eq!(result.columns[0], "name");
+}
+
+#[test]
+fn drop_view() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+
+    let _ = db.query("SELECT * FROM v").unwrap();
+
+    db.execute("DROP VIEW v").unwrap();
+
+    let result = db.query("SELECT * FROM v");
+    assert!(result.is_err());
+}
+
+#[test]
+fn drop_view_if_exists() {
+    let (_dir, db) = open_db();
+    db.execute("DROP VIEW IF EXISTS nonexistent_view").unwrap();
+}
+
+#[test]
+fn create_view_if_not_exists() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+    db.execute("CREATE VIEW IF NOT EXISTS v AS SELECT * FROM t").unwrap();
+}
+
+#[test]
+fn create_view_duplicate_fails() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+    let result = db.execute("CREATE VIEW v AS SELECT * FROM t");
+    assert!(result.is_err());
+}
+
+#[test]
+fn view_with_column_aliases() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+
+    db.execute("CREATE VIEW v (item_id, item_value) AS SELECT id, val FROM t").unwrap();
+
+    let result = db.query("SELECT * FROM v").unwrap();
+    assert_eq!(result.columns[0], "item_id");
+    assert_eq!(result.columns[1], "item_value");
+    assert_eq!(result.len(), 1);
+}
+
+#[test]
+fn view_reflects_underlying_data_changes() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    db.execute("CREATE VIEW v AS SELECT * FROM t").unwrap();
+
+    let r1 = db.query("SELECT * FROM v").unwrap();
+    assert_eq!(r1.len(), 1);
+
+    db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+
+    let r2 = db.query("SELECT * FROM v").unwrap();
+    assert_eq!(r2.len(), 2);
+}
+
+// =========================================================================
+// Trigger tests
+// =========================================================================
+
+#[test]
+fn trigger_after_insert() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, product TEXT, amount INTEGER)").unwrap();
+    db.execute("CREATE TABLE audit_log (id INTEGER PRIMARY KEY, action TEXT, order_id INTEGER)").unwrap();
+
+    db.execute("CREATE TRIGGER log_insert AFTER INSERT ON orders BEGIN INSERT INTO audit_log (action, order_id) VALUES ('INSERT', 1); END").unwrap();
+
+    db.execute("INSERT INTO orders VALUES (1, 'Widget', 5)").unwrap();
+
+    let result = db.query("SELECT * FROM audit_log").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].get("action"), Some(&Value::Text("INSERT".to_string())));
+}
+
+#[test]
+fn trigger_before_insert() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, msg TEXT)").unwrap();
+
+    db.execute("CREATE TRIGGER before_items_insert BEFORE INSERT ON items BEGIN INSERT INTO log (msg) VALUES ('before insert'); END").unwrap();
+
+    db.execute("INSERT INTO items VALUES (1, 'test')").unwrap();
+
+    let result = db.query("SELECT * FROM log").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].get("msg"), Some(&Value::Text("before insert".to_string())));
+}
+
+#[test]
+fn trigger_after_update() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+    db.execute("CREATE TABLE changes (id INTEGER PRIMARY KEY, note TEXT)").unwrap();
+
+    db.execute("CREATE TRIGGER log_update AFTER UPDATE ON data BEGIN INSERT INTO changes (note) VALUES ('updated'); END").unwrap();
+
+    db.execute("INSERT INTO data VALUES (1, 10)").unwrap();
+    db.execute("UPDATE data SET val = 20 WHERE id = 1").unwrap();
+
+    let result = db.query("SELECT * FROM changes").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].get("note"), Some(&Value::Text("updated".to_string())));
+}
+
+#[test]
+fn trigger_after_delete() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE records (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE deletion_log (id INTEGER PRIMARY KEY, msg TEXT)").unwrap();
+
+    db.execute("CREATE TRIGGER log_delete AFTER DELETE ON records BEGIN INSERT INTO deletion_log (msg) VALUES ('deleted'); END").unwrap();
+
+    db.execute("INSERT INTO records VALUES (1, 'test')").unwrap();
+    db.execute("DELETE FROM records WHERE id = 1").unwrap();
+
+    let result = db.query("SELECT * FROM deletion_log").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.rows[0].get("msg"), Some(&Value::Text("deleted".to_string())));
+}
+
+#[test]
+fn drop_trigger() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, msg TEXT)").unwrap();
+
+    db.execute("CREATE TRIGGER t_trig AFTER INSERT ON t BEGIN INSERT INTO log (msg) VALUES ('inserted'); END").unwrap();
+
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+    let r1 = db.query("SELECT * FROM log").unwrap();
+    assert_eq!(r1.len(), 1);
+
+    db.execute("DROP TRIGGER t_trig").unwrap();
+
+    db.execute("INSERT INTO t VALUES (2)").unwrap();
+    let r2 = db.query("SELECT * FROM log").unwrap();
+    assert_eq!(r2.len(), 1);
+}
+
+#[test]
+fn drop_trigger_if_exists() {
+    let (_dir, db) = open_db();
+    db.execute("DROP TRIGGER IF EXISTS nonexistent_trigger").unwrap();
+}
+
+#[test]
+fn create_trigger_if_not_exists() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, msg TEXT)").unwrap();
+
+    db.execute("CREATE TRIGGER t_trig AFTER INSERT ON t BEGIN INSERT INTO log (msg) VALUES ('x'); END").unwrap();
+    db.execute("CREATE TRIGGER IF NOT EXISTS t_trig AFTER INSERT ON t BEGIN INSERT INTO log (msg) VALUES ('x'); END").unwrap();
+}
+
+#[test]
+fn trigger_multiple_body_statements() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE log1 (id INTEGER PRIMARY KEY, msg TEXT)").unwrap();
+    db.execute("CREATE TABLE log2 (id INTEGER PRIMARY KEY, msg TEXT)").unwrap();
+
+    db.execute("CREATE TRIGGER multi_trig AFTER INSERT ON src BEGIN INSERT INTO log1 (msg) VALUES ('log1'); INSERT INTO log2 (msg) VALUES ('log2'); END").unwrap();
+
+    db.execute("INSERT INTO src VALUES (1, 'test')").unwrap();
+
+    let r1 = db.query("SELECT * FROM log1").unwrap();
+    assert_eq!(r1.len(), 1);
+
+    let r2 = db.query("SELECT * FROM log2").unwrap();
+    assert_eq!(r2.len(), 1);
+}
+
+#[test]
+fn trigger_before_and_after_on_same_table() {
+    let (_dir, db) = open_db();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+    db.execute("CREATE TABLE log (id INTEGER PRIMARY KEY, msg TEXT)").unwrap();
+
+    db.execute("CREATE TRIGGER before_t BEFORE INSERT ON t BEGIN INSERT INTO log (msg) VALUES ('before'); END").unwrap();
+    db.execute("CREATE TRIGGER after_t AFTER INSERT ON t BEGIN INSERT INTO log (msg) VALUES ('after'); END").unwrap();
+
+    db.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let result = db.query("SELECT * FROM log").unwrap();
+    assert_eq!(result.len(), 2);
+    let msgs: Vec<&Value> = result.rows.iter().map(|r| r.get("msg").unwrap()).collect();
+    assert!(msgs.contains(&&Value::Text("before".to_string())));
+    assert!(msgs.contains(&&Value::Text("after".to_string())));
+}

@@ -25,6 +25,9 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    AttachDatabase(AttachDatabaseStatement),
+    DetachDatabase(DetachDatabaseStatement),
+    Vacuum,
 }
 
 /// A `SELECT` statement, possibly with CTEs and compound operators.
@@ -175,6 +178,20 @@ pub struct ColumnDef {
     pub not_null: bool,
     pub unique: bool,
     pub default: Option<Expr>,
+    pub collation: Option<String>,
+    /// Generated column: `GENERATED ALWAYS AS (expr) STORED|VIRTUAL`
+    /// or shorthand `AS (expr) STORED|VIRTUAL`.
+    pub generated: Option<GeneratedColumn>,
+}
+
+/// Metadata for a generated column definition.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedColumn {
+    /// The expression that computes this column's value.
+    pub expr: Expr,
+    /// If `true` the value is stored on disk; if `false` it is computed on
+    /// read (VIRTUAL).
+    pub stored: bool,
 }
 
 /// A `DROP TABLE` statement.
@@ -276,6 +293,19 @@ pub struct PragmaStatement {
     pub value: Option<Expr>,
 }
 
+/// An `ATTACH DATABASE` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttachDatabaseStatement {
+    pub path: String,
+    pub schema_name: String,
+}
+
+/// A `DETACH DATABASE` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DetachDatabaseStatement {
+    pub schema_name: String,
+}
+
 // ---------------------------------------------------------------------------
 // Expressions
 // ---------------------------------------------------------------------------
@@ -334,6 +364,11 @@ pub enum Expr {
     Subquery(Box<SelectStatement>),
     Exists(Box<SelectStatement>),
     Placeholder(usize),
+    /// A `COLLATE` expression: `expr COLLATE collation_name`.
+    Collate {
+        expr: Box<Expr>,
+        collation: String,
+    },
     /// A window function call: `func(...) OVER (PARTITION BY ... ORDER BY ... frame)`.
     WindowFunction {
         function: Box<Expr>,
@@ -467,6 +502,8 @@ mod tests {
             not_null: false,
             unique: false,
             default: None,
+            collation: None,
+            generated: None,
         };
         assert!(col.primary_key);
         assert!(col.autoincrement);

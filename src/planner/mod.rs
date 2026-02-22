@@ -111,6 +111,9 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<LogicalPlan
         Statement::DropView(_) => Err(HorizonError::NotImplemented("DROP VIEW".into())),
         Statement::CreateTrigger(_) => Err(HorizonError::NotImplemented("CREATE TRIGGER".into())),
         Statement::DropTrigger(_) => Err(HorizonError::NotImplemented("DROP TRIGGER".into())),
+        Statement::AttachDatabase(_) => Err(HorizonError::NotImplemented("ATTACH DATABASE".into())),
+        Statement::DetachDatabase(_) => Err(HorizonError::NotImplemented("DETACH DATABASE".into())),
+        Statement::Vacuum => Err(HorizonError::NotImplemented("VACUUM".into())),
     }
 }
 

@@ -25,6 +25,7 @@ use crate::btree::BTree;
 use crate::buffer::BufferPool;
 use crate::error::{HorizonError, Result};
 use crate::pager::PageId;
+use crate::sql::ast::Expr;
 use crate::types::{DataType, Value, determine_affinity};
 
 /// Metadata for a single column in a table.
@@ -49,6 +50,11 @@ pub struct ColumnInfo {
     pub default_value: Option<Value>,
     /// Zero-based ordinal position within the table.
     pub position: usize,
+    /// Generated column expression (if this is a generated column).
+    pub generated_expr: Option<Expr>,
+    /// Whether the generated column is STORED (true) or VIRTUAL (false).
+    /// Only meaningful when `generated_expr` is `Some`.
+    pub is_stored: bool,
 }
 
 /// Metadata for a table.
@@ -94,10 +100,67 @@ pub struct IndexInfo {
     pub root_page: PageId,
 }
 
+/// Metadata for a view.
+#[derive(Debug, Clone)]
+pub struct ViewInfo {
+    /// View name.
+    pub name: String,
+    /// The SQL text of the SELECT statement defining this view.
+    pub sql: String,
+    /// Optional column name aliases specified in CREATE VIEW.
+    pub columns: Option<Vec<String>>,
+}
+
+/// Metadata for a trigger.
+#[derive(Debug, Clone)]
+pub struct TriggerInfo {
+    /// Trigger name.
+    pub name: String,
+    /// When the trigger fires relative to the event.
+    pub timing: TriggerTimingKind,
+    /// The DML event that activates the trigger.
+    pub event: TriggerEventKind,
+    /// The table this trigger is attached to.
+    pub table: String,
+    /// Whether the trigger fires for each row.
+    pub for_each_row: bool,
+    /// The SQL text of the trigger body statements (stored as raw SQL).
+    pub body_sql: Vec<String>,
+}
+
+/// When a trigger fires relative to the event (catalog-level copy).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerTimingKind {
+    Before,
+    After,
+    InsteadOf,
+}
+
+/// The DML event that activates a trigger (catalog-level copy).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerEventKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// Information about an attached database.
+#[derive(Debug, Clone)]
+pub struct AttachedDatabase {
+    /// File path of the attached database.
+    pub path: String,
+    /// Schema name used to reference the attached database.
+    pub schema_name: String,
+}
+
 /// The schema catalog -- tracks all tables and indexes in the database.
 pub struct Catalog {
     tables: HashMap<String, TableInfo>,
     indexes: HashMap<String, IndexInfo>,
+    views: HashMap<String, ViewInfo>,
+    triggers: HashMap<String, TriggerInfo>,
+    /// Attached databases keyed by schema name.
+    pub attached_databases: HashMap<String, AttachedDatabase>,
 }
 
 impl Catalog {
@@ -106,7 +169,51 @@ impl Catalog {
         Catalog {
             tables: HashMap::new(),
             indexes: HashMap::new(),
+            views: HashMap::new(),
+            triggers: HashMap::new(),
+            attached_databases: HashMap::new(),
         }
+    }
+
+    /// Attach a database with the given path and schema name.
+    pub fn attach_database(&mut self, path: String, schema_name: String) -> Result<()> {
+        let lower = schema_name.to_lowercase();
+        if lower == "main" || lower == "temp" {
+            return Err(HorizonError::InvalidSql(format!(
+                "cannot attach as reserved schema name: {}", schema_name
+            )));
+        }
+        if self.attached_databases.contains_key(&lower) {
+            return Err(HorizonError::InvalidSql(format!(
+                "database already attached as: {}", schema_name
+            )));
+        }
+        self.attached_databases.insert(lower, AttachedDatabase {
+            path,
+            schema_name,
+        });
+        Ok(())
+    }
+
+    /// Detach a database by schema name.
+    pub fn detach_database(&mut self, schema_name: &str) -> Result<()> {
+        let lower = schema_name.to_lowercase();
+        if self.attached_databases.remove(&lower).is_none() {
+            return Err(HorizonError::InvalidSql(format!(
+                "no such attached database: {}", schema_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Check if a schema name corresponds to an attached database.
+    pub fn is_attached(&self, schema_name: &str) -> bool {
+        self.attached_databases.contains_key(&schema_name.to_lowercase())
+    }
+
+    /// Get an attached database by schema name.
+    pub fn get_attached(&self, schema_name: &str) -> Option<&AttachedDatabase> {
+        self.attached_databases.get(&schema_name.to_lowercase())
     }
 
     /// Load the catalog from an existing schema B+Tree.
@@ -267,6 +374,75 @@ impl Catalog {
     pub fn get_indexes_for_table(&self, table_name: &str) -> Vec<&IndexInfo> {
         self.indexes.values()
             .filter(|idx| idx.table_name == table_name)
+            .collect()
+    }
+
+    // =================================================================
+    // View operations
+    // =================================================================
+
+    /// Add a view to the catalog (in-memory only).
+    pub fn create_view(&mut self, view: ViewInfo) -> Result<()> {
+        if self.views.contains_key(&view.name) {
+            return Err(HorizonError::DuplicateTable(view.name.clone()));
+        }
+        self.views.insert(view.name.clone(), view);
+        Ok(())
+    }
+
+    /// Drop a view from the catalog.
+    pub fn drop_view(&mut self, name: &str) -> Result<ViewInfo> {
+        self.views.remove(name)
+            .ok_or_else(|| HorizonError::TableNotFound(format!("view: {}", name)))
+    }
+
+    /// Check whether a view with the given name exists.
+    pub fn view_exists(&self, name: &str) -> bool {
+        self.views.contains_key(name)
+    }
+
+    /// Get a view's metadata.
+    pub fn get_view(&self, name: &str) -> Option<&ViewInfo> {
+        self.views.get(name)
+    }
+
+    // =================================================================
+    // Trigger operations
+    // =================================================================
+
+    /// Add a trigger to the catalog (in-memory only).
+    pub fn create_trigger(&mut self, trigger: TriggerInfo) -> Result<()> {
+        if self.triggers.contains_key(&trigger.name) {
+            return Err(HorizonError::DuplicateTable(trigger.name.clone()));
+        }
+        self.triggers.insert(trigger.name.clone(), trigger);
+        Ok(())
+    }
+
+    /// Drop a trigger from the catalog.
+    pub fn drop_trigger(&mut self, name: &str) -> Result<TriggerInfo> {
+        self.triggers.remove(name)
+            .ok_or_else(|| HorizonError::TableNotFound(format!("trigger: {}", name)))
+    }
+
+    /// Check whether a trigger with the given name exists.
+    pub fn trigger_exists(&self, name: &str) -> bool {
+        self.triggers.contains_key(name)
+    }
+
+    /// Return all triggers for a given table, event, and timing.
+    pub fn get_triggers_for_table(
+        &self,
+        table_name: &str,
+        event: &TriggerEventKind,
+        timing: &TriggerTimingKind,
+    ) -> Vec<&TriggerInfo> {
+        self.triggers.values()
+            .filter(|t| {
+                t.table.eq_ignore_ascii_case(table_name)
+                    && t.event == *event
+                    && t.timing == *timing
+            })
             .collect()
     }
 
@@ -581,6 +757,7 @@ impl Catalog {
                     columns.push(ColumnInfo {
                         name: col_name, type_name, affinity, primary_key,
                         autoincrement, not_null, unique, default_value: None, position,
+                        generated_expr: None, is_stored: false,
                     });
                 }
             }
@@ -651,6 +828,8 @@ mod tests {
                     unique: false,
                     default_value: None,
                     position: 0,
+                    generated_expr: None,
+                    is_stored: false,
                 },
                 ColumnInfo {
                     name: "email".to_string(),
@@ -662,6 +841,8 @@ mod tests {
                     unique: true,
                     default_value: None,
                     position: 1,
+                    generated_expr: None,
+                    is_stored: false,
                 },
                 ColumnInfo {
                     name: "score".to_string(),
@@ -673,6 +854,8 @@ mod tests {
                     unique: false,
                     default_value: None,
                     position: 2,
+                    generated_expr: None,
+                    is_stored: false,
                 },
             ],
             root_page: 7,
@@ -834,6 +1017,8 @@ mod tests {
                     unique: false,
                     default_value: None,
                     position: 0,
+                    generated_expr: None,
+                    is_stored: false,
                 },
             ],
             root_page: 3,
@@ -879,6 +1064,8 @@ mod tests {
                     unique: false,
                     default_value: None,
                     position: 0,
+                    generated_expr: None,
+                    is_stored: false,
                 },
             ],
             root_page: 5,
@@ -1162,6 +1349,8 @@ mod tests {
             unique: false,
             default_value: None,
             position: 0,
+            generated_expr: None,
+            is_stored: false,
         };
         assert_eq!(col.affinity, DataType::Text);
     }
@@ -1178,6 +1367,8 @@ mod tests {
             unique: false,
             default_value: None,
             position: 0,
+            generated_expr: None,
+            is_stored: false,
         };
         let debug = format!("{:?}", col);
         assert!(debug.contains("id"));

@@ -4,16 +4,18 @@
 //! the SQL parser/planner with the B+Tree storage, catalog, and MVCC layers.
 
 pub mod json;
+mod views_triggers;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use crate::btree::BTree;
 use crate::buffer::BufferPool;
-use crate::catalog::{Catalog, ColumnInfo, TableInfo};
+use crate::catalog::{Catalog, ColumnInfo, TableInfo, ViewInfo, TriggerInfo, TriggerTimingKind, TriggerEventKind};
 use crate::error::{HorizonError, Result};
 use crate::mvcc::{TransactionManager, UndoEntry};
 use crate::planner::{LogicalPlan, plan_statement};
 use crate::sql::ast::*;
+use crate::sql::parser::Parser;
 use crate::types::{DataType, Value, determine_affinity};
 use crate::{QueryResult, Row};
 
@@ -56,21 +58,22 @@ pub fn execute_statement(
             // PRAGMA returns rows; handled in Database::query()
             Err(HorizonError::Internal("use query() for PRAGMA statements".into()))
         }
-        Statement::CreateView(_) => {
-            Err(HorizonError::NotImplemented("CREATE VIEW".into()))
-        }
-        Statement::DropView(_) => {
-            Err(HorizonError::NotImplemented("DROP VIEW".into()))
-        }
-        Statement::CreateTrigger(_) => {
-            Err(HorizonError::NotImplemented("CREATE TRIGGER".into()))
-        }
-        Statement::DropTrigger(_) => {
-            Err(HorizonError::NotImplemented("DROP TRIGGER".into()))
-        }
+        Statement::CreateView(cv) => views_triggers::execute_create_view(cv, catalog),
+        Statement::DropView(dv) => views_triggers::execute_drop_view(dv, catalog),
+        Statement::CreateTrigger(ct) => views_triggers::execute_create_trigger(ct, catalog),
+        Statement::DropTrigger(dt) => views_triggers::execute_drop_trigger(dt, catalog),
         Statement::Select(_) => {
             Err(HorizonError::Internal("use execute_query for SELECT statements".into()))
         }
+        Statement::AttachDatabase(attach) => {
+            catalog.attach_database(attach.path.clone(), attach.schema_name.clone())?;
+            Ok(0)
+        }
+        Statement::DetachDatabase(detach) => {
+            catalog.detach_database(&detach.schema_name)?;
+            Ok(0)
+        }
+        Statement::Vacuum => execute_vacuum(pool, catalog),
     }
 }
 
@@ -135,6 +138,12 @@ fn execute_create_table(
             pk_column = Some(i);
         }
 
+        let (gen_expr, gen_stored) = if let Some(ref gen) = col_def.generated {
+            (Some(gen.expr.clone()), gen.stored)
+        } else {
+            (None, false)
+        };
+
         columns.push(ColumnInfo {
             name: col_def.name.clone(),
             type_name,
@@ -145,6 +154,8 @@ fn execute_create_table(
             unique: col_def.unique || col_def.primary_key,
             default_value: col_def.default.as_ref().map(|e| eval_const_expr(e)),
             position: i,
+            generated_expr: gen_expr,
+            is_stored: gen_stored,
         });
     }
 
@@ -174,6 +185,52 @@ fn execute_drop_table(
     Ok(0)
 }
 
+// ---- Generated Column Helper ----
+
+/// Fill in virtual generated column values in a row by evaluating their
+/// expressions. This must be called after deserializing a row from disk
+/// and before the row is used in expressions or projections.
+fn fill_virtual_columns(
+    row: &mut Vec<Value>,
+    table: &TableInfo,
+) -> Result<()> {
+    for (i, col) in table.columns.iter().enumerate() {
+        if let Some(ref gen_expr) = col.generated_expr {
+            if !col.is_stored {
+                // VIRTUAL column -- evaluate expression on the fly
+                let val = eval_expr(gen_expr, row, &table.columns, table)?;
+                if i < row.len() {
+                    row[i] = val.apply_affinity(col.affinity);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Returns true if a table has any virtual generated columns.
+fn table_has_virtual_columns(table: &TableInfo) -> bool {
+    table.columns.iter().any(|c| c.generated_expr.is_some() && !c.is_stored)
+}
+
+// ---- VACUUM ----
+
+/// Execute a VACUUM command.
+///
+/// This implementation flushes all dirty pages to disk, effectively
+/// compacting the in-memory representation. A full page-level
+/// compaction would require rewriting the entire database file, which
+/// is deferred to a future release.
+fn execute_vacuum(
+    pool: &mut BufferPool,
+    _catalog: &mut Catalog,
+) -> Result<usize> {
+    pool.flush_all()?;
+    Ok(0)
+}
+
+
+
 // ---- INSERT ----
 
 fn execute_insert(
@@ -188,21 +245,33 @@ fn execute_insert(
     let _txn_id = txn_mgr.auto_commit();
     let mut inserted = 0;
 
+    // Fire BEFORE INSERT triggers
+    views_triggers::fire_triggers(&ins.table, &TriggerEventKind::Insert, &TriggerTimingKind::Before, pool, catalog, txn_mgr)?;
+
     for value_row in &ins.values {
-        // Determine column ordering
+        // Determine column ordering, filtering out generated columns
         let col_order: Vec<usize> = if let Some(ref col_names) = ins.columns {
-            col_names
-                .iter()
-                .map(|name| {
-                    table.find_column_index(name).ok_or_else(|| {
-                        HorizonError::ColumnNotFound(format!(
-                            "{}.{}", ins.table, name
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
+            let mut order = Vec::new();
+            for name in col_names {
+                let idx = table.find_column_index(name).ok_or_else(|| {
+                    HorizonError::ColumnNotFound(format!("{}.{}", ins.table, name))
+                })?;
+                // Reject user-supplied values for generated columns
+                if table.columns[idx].generated_expr.is_some() {
+                    return Err(HorizonError::InvalidSql(format!(
+                        "cannot INSERT into generated column: {}", name
+                    )));
+                }
+                order.push(idx);
+            }
+            order
         } else {
-            (0..table.columns.len()).collect()
+            // When no column list is specified, exclude generated columns
+            // so the user only provides values for non-generated columns
+            let non_gen: Vec<usize> = (0..table.columns.len())
+                .filter(|&i| table.columns[i].generated_expr.is_none())
+                .collect();
+            non_gen
         };
 
         if value_row.len() != col_order.len() {
@@ -225,9 +294,19 @@ fn execute_insert(
 
         // Set defaults for columns not in the insert list
         for (i, col) in table.columns.iter().enumerate() {
-            if !col_order.contains(&i) {
+            if !col_order.contains(&i) && col.generated_expr.is_none() {
                 if let Some(ref default_val) = col.default_value {
                     row_values[i] = default_val.clone();
+                }
+            }
+        }
+
+        // Evaluate STORED generated column expressions
+        for (i, col) in table.columns.iter().enumerate() {
+            if let Some(ref gen_expr) = col.generated_expr {
+                if col.is_stored {
+                    let val = eval_expr(gen_expr, &row_values, &table.columns, &table)?;
+                    row_values[i] = val.apply_affinity(col.affinity);
                 }
             }
         }
@@ -271,8 +350,12 @@ fn execute_insert(
             id
         };
 
-        // Check NOT NULL constraints
+        // Check NOT NULL constraints (skip virtual generated columns)
         for (i, col) in table.columns.iter().enumerate() {
+            // Virtual generated columns are not stored; their value is NULL on disk
+            if col.generated_expr.is_some() && !col.is_stored {
+                continue;
+            }
             if col.not_null && row_values[i].is_null() {
                 return Err(HorizonError::ConstraintViolation(format!(
                     "NOT NULL constraint failed: {}.{}",
@@ -354,6 +437,9 @@ fn execute_insert(
         updated_table.root_page = tree.root_page();
     }
     catalog.update_table_meta(pool, &ins.table, &updated_table)?;
+
+    // Fire AFTER INSERT triggers
+    views_triggers::fire_triggers(&ins.table, &TriggerEventKind::Insert, &TriggerTimingKind::After, pool, catalog, txn_mgr)?;
 
     Ok(inserted)
 }
@@ -545,6 +631,12 @@ fn execute_select_body_inner(
             return Ok((col_names, rows));
         }
     };
+    // Check if this is a view and expand it
+    if !catalog.table_exists(&table_name) {
+        if let Some(view) = catalog.get_view(&table_name).cloned() {
+            return execute_view_select(select, &view, pool, catalog);
+        }
+    }
     let table = catalog.get_table(&table_name)?.clone();
     let data_tree = BTree::open(table.root_page);
     let entries = if let Some(ref where_clause) = select.where_clause {
@@ -553,9 +645,13 @@ fn execute_select_body_inner(
         } else { data_tree.scan_all(pool)? }
     } else { data_tree.scan_all(pool)? };
     let column_names = resolve_column_names(&select.columns, &table)?;
+    let has_virtual = table_has_virtual_columns(&table);
     let mut rows = Vec::new();
     for entry in &entries {
-        let row_values = deserialize_row(&entry.value, table.columns.len())?;
+        let mut row_values = deserialize_row(&entry.value, table.columns.len())?;
+        if has_virtual {
+            fill_virtual_columns(&mut row_values, &table)?;
+        }
         if let Some(ref where_clause) = select.where_clause {
             let result = eval_expr_with_ctx(where_clause, &row_values, &table.columns, &table, pool, catalog)?;
             if !result.to_bool() { continue; }
@@ -584,6 +680,75 @@ fn execute_select_body_inner(
         rows.truncate(limit);
     }
     Ok((column_names, rows))
+}
+
+fn execute_view_select(
+    outer_select: &SelectStatement, view: &ViewInfo, pool: &mut BufferPool, catalog: &mut Catalog,
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let view_stmts = Parser::parse(&view.sql)?;
+    let view_select = match view_stmts.into_iter().next() {
+        Some(Statement::Select(sel)) => sel,
+        _ => return Err(HorizonError::Internal("view SQL is not a SELECT".into())),
+    };
+    let cte_store = CteStore::new();
+    let (mut view_col_names, view_rows) = execute_select_body_inner(&view_select, pool, catalog, &cte_store)?;
+    if let Some(ref aliases) = view.columns {
+        for (i, alias) in aliases.iter().enumerate() {
+            if i < view_col_names.len() { view_col_names[i] = alias.clone(); }
+        }
+    }
+    let is_star = outer_select.columns.len() == 1 && matches!(outer_select.columns[0], SelectColumn::AllColumns);
+    if is_star && outer_select.where_clause.is_none() && outer_select.order_by.is_empty()
+        && outer_select.limit.is_none() && outer_select.offset.is_none() {
+        return Ok((view_col_names, view_rows));
+    }
+    let filtered = if let Some(ref wh) = outer_select.where_clause {
+        let mut r = Vec::new();
+        for row in &view_rows {
+            if eval_expr_dynamic(wh, row, &view_col_names)?.to_bool() { r.push(row.clone()); }
+        }
+        r
+    } else { view_rows };
+    let mut col_names = Vec::new();
+    let mut proj_rows = Vec::new();
+    if is_star {
+        col_names = view_col_names.clone();
+        proj_rows = filtered;
+    } else {
+        for sc in &outer_select.columns {
+            match sc {
+                SelectColumn::AllColumns | SelectColumn::TableAllColumns(_) => col_names.extend(view_col_names.clone()),
+                SelectColumn::Expr { expr, alias } => col_names.push(alias.clone().unwrap_or_else(|| {
+                    if let Expr::Column { name, .. } = expr { name.clone() } else { format!("{:?}", expr) }
+                })),
+            }
+        }
+        for row in &filtered {
+            let mut pr = Vec::new();
+            for sc in &outer_select.columns {
+                match sc {
+                    SelectColumn::AllColumns | SelectColumn::TableAllColumns(_) => pr.extend(row.clone()),
+                    SelectColumn::Expr { expr, .. } => pr.push(eval_expr_dynamic(expr, row, &view_col_names)?),
+                }
+            }
+            proj_rows.push(pr);
+        }
+    }
+    if !outer_select.order_by.is_empty() {
+        let ca = Arc::new(col_names.clone());
+        let mut rr: Vec<Row> = proj_rows.into_iter().map(|v| Row { columns: ca.clone(), values: v }).collect();
+        sort_rows_by_index(&mut rr, &outer_select.order_by, &col_names)?;
+        proj_rows = rr.into_iter().map(|r| r.values).collect();
+    }
+    if let Some(ref oe) = outer_select.offset {
+        let o = eval_const_expr(oe).as_integer().unwrap_or(0) as usize;
+        if o < proj_rows.len() { proj_rows = proj_rows.into_iter().skip(o).collect(); } else { proj_rows.clear(); }
+    }
+    if let Some(ref le) = outer_select.limit {
+        let l = eval_const_expr(le).as_integer().unwrap_or(i64::MAX) as usize;
+        proj_rows.truncate(l);
+    }
+    Ok((col_names, proj_rows))
 }
 
 fn try_resolve_cte_from<'a>(from: &FromClause, cte_store: &'a CteStore) -> Option<&'a (Vec<String>, Vec<Vec<Value>>)> {
@@ -787,7 +952,12 @@ fn sort_rows_by_index(rows: &mut [Row], order_by: &[OrderByItem], col_names: &[S
         for item in order_by {
             let va = eval_expr_dynamic(&item.expr, &a.values, col_names).unwrap_or(Value::Null);
             let vb = eval_expr_dynamic(&item.expr, &b.values, col_names).unwrap_or(Value::Null);
-            let cmp = if item.desc { va.cmp(&vb).reverse() } else { va.cmp(&vb) };
+            let cmp = if let Some(coll) = extract_collation(&item.expr) {
+                compare_with_collation(&va, &vb, coll)
+            } else {
+                va.cmp(&vb)
+            };
+            let cmp = if item.desc { cmp.reverse() } else { cmp };
             if cmp != std::cmp::Ordering::Equal { return cmp; }
         }
         std::cmp::Ordering::Equal
@@ -1585,6 +1755,10 @@ fn eval_expr_dynamic(
                 "window functions must be evaluated via the window execution path".into(),
             ))
         }
+        Expr::Collate { expr: inner, .. } => {
+            // Evaluate the inner expression, ignoring collation for now
+            eval_expr_dynamic(inner, row, col_names)
+        }
     }
 }
 
@@ -2135,7 +2309,560 @@ fn eval_function_dynamic(
             }
             Ok(Value::Text(result))
         }
+        // -- Date/Time functions --
+        "DATE" | "TIME" | "DATETIME" | "STRFTIME" | "JULIANDAY" => {
+            let mut arg_values = Vec::new();
+            for arg in args {
+                arg_values.push(eval_expr_dynamic(arg, row, col_names)?);
+            }
+            Ok(eval_datetime_function(&upper, &arg_values))
+        }
         _ => Err(HorizonError::NotImplemented(format!("function: {}", name))),
+    }
+}
+
+// =========================================================================
+// Date/Time helpers (no external dependencies -- pure manual parsing)
+// =========================================================================
+
+/// A parsed date-time value used internally by date/time functions.
+#[derive(Debug, Clone)]
+struct DateTime {
+    year: i64,
+    month: u32,  // 1..=12
+    day: u32,    // 1..=31
+    hour: u32,   // 0..=23
+    minute: u32, // 0..=59
+    second: u32, // 0..=59
+    millisecond: u32, // 0..=999
+}
+
+impl DateTime {
+    /// Format as 'YYYY-MM-DD'.
+    fn format_date(&self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    /// Format as 'HH:MM:SS'.
+    fn format_time(&self) -> String {
+        format!("{:02}:{:02}:{:02}", self.hour, self.minute, self.second)
+    }
+
+    /// Format as 'YYYY-MM-DD HH:MM:SS'.
+    fn format_datetime(&self) -> String {
+        format!("{} {}", self.format_date(), self.format_time())
+    }
+
+    /// Compute Julian Day Number as f64.
+    fn to_julian_day(&self) -> f64 {
+        // Algorithm from Meeus "Astronomical Algorithms"
+        let y = self.year as f64;
+        let m = self.month as f64;
+        let d = self.day as f64;
+
+        let (y2, m2) = if m <= 2.0 {
+            (y - 1.0, m + 12.0)
+        } else {
+            (y, m)
+        };
+
+        let a = (y2 / 100.0).floor();
+        let b = 2.0 - a + (a / 4.0).floor();
+
+        let jd = (365.25 * (y2 + 4716.0)).floor()
+            + (30.6001 * (m2 + 1.0)).floor()
+            + d
+            + b
+            - 1524.5;
+
+        // Add time fraction
+        let time_frac = (self.hour as f64) / 24.0
+            + (self.minute as f64) / 1440.0
+            + (self.second as f64) / 86400.0
+            + (self.millisecond as f64) / 86400000.0;
+
+        jd + time_frac
+    }
+
+    /// Apply a strftime format string.
+    fn strftime(&self, fmt: &str) -> String {
+        let mut result = String::new();
+        let chars: Vec<char> = fmt.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            if chars[i] == '%' && i + 1 < chars.len() {
+                i += 1;
+                match chars[i] {
+                    'Y' => result.push_str(&format!("{:04}", self.year)),
+                    'm' => result.push_str(&format!("{:02}", self.month)),
+                    'd' => result.push_str(&format!("{:02}", self.day)),
+                    'H' => result.push_str(&format!("{:02}", self.hour)),
+                    'M' => result.push_str(&format!("{:02}", self.minute)),
+                    'S' => result.push_str(&format!("{:02}", self.second)),
+                    'f' => {
+                        // Fractional seconds: SS.SSS
+                        result.push_str(&format!("{:02}.{:03}", self.second, self.millisecond));
+                    }
+                    'j' => {
+                        // Day of year (001-366)
+                        let doy = day_of_year(self.year, self.month, self.day);
+                        result.push_str(&format!("{:03}", doy));
+                    }
+                    'J' => {
+                        // Julian day number
+                        let jd = self.to_julian_day();
+                        result.push_str(&format!("{:.6}", jd));
+                    }
+                    'w' => {
+                        // Day of week 0=Sunday, 6=Saturday
+                        let dow = day_of_week(self.year, self.month, self.day);
+                        result.push_str(&format!("{}", dow));
+                    }
+                    'W' => {
+                        // Week of year (00-53, Monday is the first day of the week)
+                        let doy = day_of_year(self.year, self.month, self.day);
+                        let dow = day_of_week(self.year, self.month, self.day);
+                        // Convert Sunday=0 to Monday=0 based
+                        let monday_dow = if dow == 0 { 6 } else { dow - 1 };
+                        let week = (doy as i32 + 6 - monday_dow as i32) / 7;
+                        result.push_str(&format!("{:02}", week));
+                    }
+                    's' => {
+                        // Seconds since 1970-01-01 00:00:00 UTC
+                        let epoch = DateTime {
+                            year: 1970, month: 1, day: 1,
+                            hour: 0, minute: 0, second: 0, millisecond: 0,
+                        };
+                        let diff_jd = self.to_julian_day() - epoch.to_julian_day();
+                        let secs = (diff_jd * 86400.0) as i64;
+                        result.push_str(&format!("{}", secs));
+                    }
+                    '%' => result.push('%'),
+                    c => {
+                        result.push('%');
+                        result.push(c);
+                    }
+                }
+            } else {
+                result.push(chars[i]);
+            }
+            i += 1;
+        }
+        result
+    }
+
+    /// Add N days (can be negative).
+    fn add_days(&mut self, n: i64) {
+        if n >= 0 {
+            for _ in 0..n {
+                self.add_one_day();
+            }
+        } else {
+            for _ in 0..(-n) {
+                self.subtract_one_day();
+            }
+        }
+    }
+
+    /// Add N months (can be negative).
+    fn add_months(&mut self, n: i64) {
+        let total_months = self.year * 12 + (self.month as i64 - 1) + n;
+        self.year = total_months.div_euclid(12);
+        self.month = (total_months.rem_euclid(12) + 1) as u32;
+        let max_day = days_in_month(self.year, self.month);
+        if self.day > max_day {
+            self.day = max_day;
+        }
+    }
+
+    /// Add N years (can be negative).
+    fn add_years(&mut self, n: i64) {
+        self.year += n;
+        let max_day = days_in_month(self.year, self.month);
+        if self.day > max_day {
+            self.day = max_day;
+        }
+    }
+
+    fn add_one_day(&mut self) {
+        self.day += 1;
+        let max = days_in_month(self.year, self.month);
+        if self.day > max {
+            self.day = 1;
+            self.month += 1;
+            if self.month > 12 {
+                self.month = 1;
+                self.year += 1;
+            }
+        }
+    }
+
+    fn subtract_one_day(&mut self) {
+        if self.day > 1 {
+            self.day -= 1;
+        } else {
+            if self.month > 1 {
+                self.month -= 1;
+            } else {
+                self.month = 12;
+                self.year -= 1;
+            }
+            self.day = days_in_month(self.year, self.month);
+        }
+    }
+}
+
+/// Whether a year is a leap year.
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
+}
+
+/// Number of days in a month.
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 => 31,
+        2 => if is_leap_year(year) { 29 } else { 28 },
+        3 => 31,
+        4 => 30,
+        5 => 31,
+        6 => 30,
+        7 => 31,
+        8 => 31,
+        9 => 30,
+        10 => 31,
+        11 => 30,
+        12 => 31,
+        _ => 30,
+    }
+}
+
+/// Day of year (1-based).
+fn day_of_year(year: i64, month: u32, day: u32) -> u32 {
+    let mut doy = 0u32;
+    for m in 1..month {
+        doy += days_in_month(year, m);
+    }
+    doy + day
+}
+
+/// Day of week: 0 = Sunday, 1 = Monday, ..., 6 = Saturday.
+/// Uses Tomohiko Sakamoto's algorithm.
+fn day_of_week(year: i64, month: u32, day: u32) -> u32 {
+    let t = [0i64, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = if month < 3 { year - 1 } else { year };
+    let result = (y + y / 4 - y / 100 + y / 400 + t[(month - 1) as usize] + day as i64) % 7;
+    result.rem_euclid(7) as u32
+}
+
+/// Parse a time string into a DateTime. Supported formats:
+/// - 'now'
+/// - 'YYYY-MM-DD'
+/// - 'YYYY-MM-DD HH:MM:SS'
+/// - 'YYYY-MM-DD HH:MM:SS.SSS'
+fn parse_timestring(s: &str) -> Option<DateTime> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("now") {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let total_secs = now.as_secs();
+        let millis = now.subsec_millis();
+
+        let total_days = (total_secs / 86400) as i64;
+        let time_of_day = total_secs % 86400;
+        let hour = (time_of_day / 3600) as u32;
+        let minute = ((time_of_day % 3600) / 60) as u32;
+        let second = (time_of_day % 60) as u32;
+
+        let (year, month, day) = civil_from_days(total_days);
+
+        return Some(DateTime {
+            year, month, day, hour, minute, second,
+            millisecond: millis,
+        });
+    }
+
+    if s.len() < 10 {
+        return None;
+    }
+
+    let year = dt_parse_i64(&s[0..4])?;
+    if s.as_bytes().get(4) != Some(&b'-') { return None; }
+    let month = dt_parse_u32(&s[5..7])?;
+    if s.as_bytes().get(7) != Some(&b'-') { return None; }
+    let day = dt_parse_u32(&s[8..10])?;
+
+    if month < 1 || month > 12 { return None; }
+    if day < 1 || day > days_in_month(year, month) { return None; }
+
+    let mut dt = DateTime {
+        year, month, day,
+        hour: 0, minute: 0, second: 0, millisecond: 0,
+    };
+
+    if s.len() == 10 {
+        return Some(dt);
+    }
+
+    let sep = s.as_bytes().get(10)?;
+    if *sep != b' ' && *sep != b'T' { return None; }
+
+    if s.len() < 19 { return None; }
+
+    dt.hour = dt_parse_u32(&s[11..13])?;
+    if s.as_bytes().get(13) != Some(&b':') { return None; }
+    dt.minute = dt_parse_u32(&s[14..16])?;
+    if s.as_bytes().get(16) != Some(&b':') { return None; }
+    dt.second = dt_parse_u32(&s[17..19])?;
+
+    if dt.hour > 23 || dt.minute > 59 || dt.second > 59 {
+        return None;
+    }
+
+    if s.len() > 19 && s.as_bytes().get(19) == Some(&b'.') {
+        let frac_str = &s[20..];
+        let frac_digits = frac_str.len().min(3);
+        if frac_digits > 0 {
+            let mut ms = dt_parse_u32(&frac_str[..frac_digits])?;
+            for _ in frac_digits..3 {
+                ms *= 10;
+            }
+            dt.millisecond = ms;
+        }
+    }
+
+    Some(dt)
+}
+
+/// Parse a modifier string and apply it to a DateTime.
+fn apply_modifier(dt: &mut DateTime, modifier: &str) -> bool {
+    let s = modifier.trim();
+
+    if s.eq_ignore_ascii_case("start of month") {
+        dt.day = 1;
+        dt.hour = 0;
+        dt.minute = 0;
+        dt.second = 0;
+        dt.millisecond = 0;
+        return true;
+    }
+
+    if s.eq_ignore_ascii_case("start of year") {
+        dt.month = 1;
+        dt.day = 1;
+        dt.hour = 0;
+        dt.minute = 0;
+        dt.second = 0;
+        dt.millisecond = 0;
+        return true;
+    }
+
+    if s.eq_ignore_ascii_case("start of day") {
+        dt.hour = 0;
+        dt.minute = 0;
+        dt.second = 0;
+        dt.millisecond = 0;
+        return true;
+    }
+
+    // '+N days', '-N days', '+N months', '-N months', '+N years', '-N years'
+    let parts: Vec<&str> = s.splitn(2, ' ').collect();
+    if parts.len() == 2 {
+        let unit = parts[1].to_lowercase();
+        if let Some(n) = dt_parse_modifier_number(parts[0]) {
+            match unit.as_str() {
+                "days" | "day" => {
+                    dt.add_days(n);
+                    return true;
+                }
+                "months" | "month" => {
+                    dt.add_months(n);
+                    return true;
+                }
+                "years" | "year" => {
+                    dt.add_years(n);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    false
+}
+
+/// Parse a modifier number like "+5", "-3", "7".
+fn dt_parse_modifier_number(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    if s.starts_with('+') {
+        dt_parse_i64(&s[1..])
+    } else if s.starts_with('-') {
+        dt_parse_i64(&s[1..]).map(|v| -v)
+    } else {
+        dt_parse_i64(s)
+    }
+}
+
+/// Simple integer parser for date/time (no external deps).
+fn dt_parse_i64(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    let mut result: i64 = 0;
+    for &b in s.as_bytes() {
+        if !b.is_ascii_digit() { return None; }
+        result = result.checked_mul(10)?.checked_add((b - b'0') as i64)?;
+    }
+    Some(result)
+}
+
+/// Simple u32 parser for date/time.
+fn dt_parse_u32(s: &str) -> Option<u32> {
+    let v = dt_parse_i64(s)?;
+    if v < 0 || v > u32::MAX as i64 { return None; }
+    Some(v as u32)
+}
+
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+/// Civil date algorithm from Howard Hinnant.
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y_final = if m <= 2 { y + 1 } else { y };
+    (y_final, m as u32, d as u32)
+}
+
+/// Evaluate a date/time function given its name and already-evaluated arguments.
+fn eval_datetime_function(name: &str, arg_values: &[Value]) -> Value {
+    let upper = name.to_uppercase();
+    match upper.as_str() {
+        "DATE" => {
+            if arg_values.is_empty() {
+                return Value::Null;
+            }
+            let ts = match &arg_values[0] {
+                Value::Text(s) => s.as_str(),
+                _ => return Value::Null,
+            };
+            let mut dt = match parse_timestring(ts) {
+                Some(d) => d,
+                None => return Value::Null,
+            };
+            for arg in &arg_values[1..] {
+                if let Value::Text(m) = arg {
+                    if !apply_modifier(&mut dt, m) {
+                        return Value::Null;
+                    }
+                } else {
+                    return Value::Null;
+                }
+            }
+            Value::Text(dt.format_date())
+        }
+        "TIME" => {
+            if arg_values.is_empty() {
+                return Value::Null;
+            }
+            let ts = match &arg_values[0] {
+                Value::Text(s) => s.as_str(),
+                _ => return Value::Null,
+            };
+            let mut dt = match parse_timestring(ts) {
+                Some(d) => d,
+                None => return Value::Null,
+            };
+            for arg in &arg_values[1..] {
+                if let Value::Text(m) = arg {
+                    if !apply_modifier(&mut dt, m) {
+                        return Value::Null;
+                    }
+                } else {
+                    return Value::Null;
+                }
+            }
+            Value::Text(dt.format_time())
+        }
+        "DATETIME" => {
+            if arg_values.is_empty() {
+                return Value::Null;
+            }
+            let ts = match &arg_values[0] {
+                Value::Text(s) => s.as_str(),
+                _ => return Value::Null,
+            };
+            let mut dt = match parse_timestring(ts) {
+                Some(d) => d,
+                None => return Value::Null,
+            };
+            for arg in &arg_values[1..] {
+                if let Value::Text(m) = arg {
+                    if !apply_modifier(&mut dt, m) {
+                        return Value::Null;
+                    }
+                } else {
+                    return Value::Null;
+                }
+            }
+            Value::Text(dt.format_datetime())
+        }
+        "STRFTIME" => {
+            if arg_values.len() < 2 {
+                return Value::Null;
+            }
+            let fmt = match &arg_values[0] {
+                Value::Text(s) => s.clone(),
+                _ => return Value::Null,
+            };
+            let ts = match &arg_values[1] {
+                Value::Text(s) => s.as_str(),
+                _ => return Value::Null,
+            };
+            let mut dt = match parse_timestring(ts) {
+                Some(d) => d,
+                None => return Value::Null,
+            };
+            for arg in &arg_values[2..] {
+                if let Value::Text(m) = arg {
+                    if !apply_modifier(&mut dt, m) {
+                        return Value::Null;
+                    }
+                } else {
+                    return Value::Null;
+                }
+            }
+            Value::Text(dt.strftime(&fmt))
+        }
+        "JULIANDAY" => {
+            if arg_values.is_empty() {
+                return Value::Null;
+            }
+            let ts = match &arg_values[0] {
+                Value::Text(s) => s.as_str(),
+                _ => return Value::Null,
+            };
+            let mut dt = match parse_timestring(ts) {
+                Some(d) => d,
+                None => return Value::Null,
+            };
+            for arg in &arg_values[1..] {
+                if let Value::Text(m) = arg {
+                    if !apply_modifier(&mut dt, m) {
+                        return Value::Null;
+                    }
+                } else {
+                    return Value::Null;
+                }
+            }
+            Value::Real(dt.to_julian_day())
+        }
+        _ => Value::Null,
     }
 }
 
@@ -2479,7 +3206,11 @@ fn sort_rows_dynamic(
         for item in order_by {
             let val_a = eval_expr_dynamic(&item.expr, a, col_names).unwrap_or(Value::Null);
             let val_b = eval_expr_dynamic(&item.expr, b, col_names).unwrap_or(Value::Null);
-            let cmp = val_a.cmp(&val_b);
+            let cmp = if let Some(coll) = extract_collation(&item.expr) {
+                compare_with_collation(&val_a, &val_b, coll)
+            } else {
+                val_a.cmp(&val_b)
+            };
             let cmp = if item.desc { cmp.reverse() } else { cmp };
             if cmp != std::cmp::Ordering::Equal {
                 return cmp;
@@ -2671,6 +3402,9 @@ fn execute_update(
     let table = catalog.get_table(&upd.table)?.clone();
     let mut tree = BTree::open(table.root_page);
 
+    // Fire BEFORE UPDATE triggers
+    views_triggers::fire_triggers(&upd.table, &TriggerEventKind::Update, &TriggerTimingKind::Before, pool, catalog, txn_mgr)?;
+
     let entries = tree.scan_all(pool)?;
     let mut updated = 0;
 
@@ -2716,6 +3450,9 @@ fn execute_update(
         catalog.update_table_meta(pool, &upd.table, &updated_table)?;
     }
 
+    // Fire AFTER UPDATE triggers
+    views_triggers::fire_triggers(&upd.table, &TriggerEventKind::Update, &TriggerTimingKind::After, pool, catalog, txn_mgr)?;
+
     Ok(updated)
 }
 
@@ -2727,6 +3464,9 @@ fn execute_delete(
     catalog: &mut Catalog,
     txn_mgr: &mut TransactionManager,
 ) -> Result<usize> {
+    // Fire BEFORE DELETE triggers
+    views_triggers::fire_triggers(&del.table, &TriggerEventKind::Delete, &TriggerTimingKind::Before, pool, catalog, txn_mgr)?;
+
     let table = catalog.get_table(&del.table)?.clone();
     let mut tree = BTree::open(table.root_page);
 
@@ -2763,6 +3503,9 @@ fn execute_delete(
         updated_table.root_page = tree.root_page();
         catalog.update_table_meta(pool, &del.table, &updated_table)?;
     }
+
+    // Fire AFTER DELETE triggers
+    views_triggers::fire_triggers(&del.table, &TriggerEventKind::Delete, &TriggerTimingKind::After, pool, catalog, txn_mgr)?;
 
     Ok(deleted)
 }
@@ -2820,9 +3563,19 @@ fn execute_insert_returning(
         }
 
         for (i, col) in table.columns.iter().enumerate() {
-            if !col_order.contains(&i) {
+            if !col_order.contains(&i) && col.generated_expr.is_none() {
                 if let Some(ref default_val) = col.default_value {
                     row_values[i] = default_val.clone();
+                }
+            }
+        }
+
+        // Evaluate STORED generated columns
+        for (i, col) in table.columns.iter().enumerate() {
+            if let Some(ref gen_expr) = col.generated_expr {
+                if col.is_stored {
+                    let val = eval_expr(gen_expr, &row_values, &table.columns, &table)?;
+                    row_values[i] = val.apply_affinity(col.affinity);
                 }
             }
         }
@@ -2894,6 +3647,11 @@ fn execute_insert_returning(
 
         let row_data = serialize_row(&row_values);
         tree.insert(pool, &key, &row_data)?;
+
+        // Fill virtual generated columns for RETURNING
+        if table_has_virtual_columns(&table) {
+            fill_virtual_columns(&mut row_values, &table)?;
+        }
 
         // Project the RETURNING columns from the inserted row
         let projected = project_row_returning(returning_cols, &row_values, &table)?;
@@ -3144,12 +3902,19 @@ fn execute_alter_table(alter: &AlterTableStatement, pool: &mut BufferPool, catal
             let affinity = determine_affinity(&type_name);
             let table = catalog.get_table(&alter.table)?;
             let position = table.columns.len();
+            let (gen_expr, gen_stored) = if let Some(ref gen) = col_def.generated {
+                (Some(gen.expr.clone()), gen.stored)
+            } else {
+                (None, false)
+            };
             let col_info = ColumnInfo {
                 name: col_def.name.clone(), type_name, affinity,
                 primary_key: false, autoincrement: false,
                 not_null: col_def.not_null, unique: col_def.unique,
                 default_value: col_def.default.as_ref().map(|e| eval_const_expr(e)),
                 position,
+                generated_expr: gen_expr,
+                is_stored: gen_stored,
             };
             catalog.add_column(pool, &alter.table, col_info)?;
             Ok(0)
@@ -3653,6 +4418,10 @@ fn eval_expr(
                 "window functions must be evaluated via the window execution path".into(),
             ))
         }
+        Expr::Collate { expr: inner, .. } => {
+            // Evaluate the inner expression, ignoring collation for now
+            eval_expr(inner, row, columns, table)
+        }
     }
 }
 
@@ -3875,6 +4644,49 @@ fn literal_to_value(lit: &LiteralValue) -> Value {
         LiteralValue::Blob(b) => Value::Blob(b.clone()),
         LiteralValue::True => Value::Integer(1),
         LiteralValue::False => Value::Integer(0),
+    }
+}
+
+/// Compare two values using the specified collation sequence.
+/// Supported collations: BINARY (default), NOCASE (case-insensitive), RTRIM (ignore trailing spaces).
+fn compare_with_collation(a: &Value, b: &Value, collation: &str) -> std::cmp::Ordering {
+    let coll_upper = collation.to_uppercase();
+    match coll_upper.as_str() {
+        "NOCASE" => {
+            // Case-insensitive comparison for text values
+            match (a, b) {
+                (Value::Text(sa), Value::Text(sb)) => {
+                    let la = sa.to_lowercase();
+                    let lb = sb.to_lowercase();
+                    la.cmp(&lb)
+                }
+                _ => a.cmp(b),
+            }
+        }
+        "RTRIM" => {
+            // Ignore trailing spaces for text values
+            match (a, b) {
+                (Value::Text(sa), Value::Text(sb)) => {
+                    let ta = sa.trim_end();
+                    let tb = sb.trim_end();
+                    ta.cmp(tb)
+                }
+                _ => a.cmp(b),
+            }
+        }
+        _ => {
+            // BINARY or unknown — default comparison
+            a.cmp(b)
+        }
+    }
+}
+
+/// Extract collation name from an expression if it has one.
+fn extract_collation(expr: &Expr) -> Option<&str> {
+    if let Expr::Collate { collation, .. } = expr {
+        Some(collation.as_str())
+    } else {
+        None
     }
 }
 
@@ -4510,6 +5322,14 @@ fn eval_function(
             }
             Ok(Value::Text(result))
         }
+        // -- Date/Time functions --
+        "DATE" | "TIME" | "DATETIME" | "STRFTIME" | "JULIANDAY" => {
+            let mut arg_values = Vec::new();
+            for arg in args {
+                arg_values.push(eval_expr(arg, row, columns, table)?);
+            }
+            Ok(eval_datetime_function(&upper, &arg_values))
+        }
         _ => Err(HorizonError::NotImplemented(format!("function: {}", name))),
     }
 }
@@ -4646,7 +5466,11 @@ fn sort_rows(
                 .unwrap_or(Value::Null);
             let val_b = eval_expr(&item.expr, &b.values, &table.columns, table)
                 .unwrap_or(Value::Null);
-            let cmp = val_a.cmp(&val_b);
+            let cmp = if let Some(coll) = extract_collation(&item.expr) {
+                compare_with_collation(&val_a, &val_b, coll)
+            } else {
+                val_a.cmp(&val_b)
+            };
             let cmp = if item.desc { cmp.reverse() } else { cmp };
             if cmp != std::cmp::Ordering::Equal {
                 return cmp;

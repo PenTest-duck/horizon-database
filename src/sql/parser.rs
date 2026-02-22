@@ -138,6 +138,10 @@ impl Parser {
             Token::End => "end",
             Token::To => "to",
             Token::If => "if",
+            Token::Generated => "generated",
+            Token::Always => "always",
+            Token::Stored => "stored",
+            Token::Virtual => "virtual",
             _ => return None,
         };
         Some(name.to_string())
@@ -182,6 +186,31 @@ impl Parser {
                     self.advance();
                 }
                 Ok(Statement::Rollback)
+            }
+            Token::Attach => {
+                self.advance();
+                if self.current() == &Token::Database {
+                    self.advance();
+                }
+                let path = match self.current() {
+                    Token::StringLiteral(s) => { let s = s.clone(); self.advance(); s }
+                    _ => return Err(self.error("expected string path after ATTACH".into())),
+                };
+                self.expect(&Token::As)?;
+                let schema_name = self.expect_identifier()?;
+                Ok(Statement::AttachDatabase(AttachDatabaseStatement { path, schema_name }))
+            }
+            Token::Detach => {
+                self.advance();
+                if self.current() == &Token::Database {
+                    self.advance();
+                }
+                let schema_name = self.expect_identifier()?;
+                Ok(Statement::DetachDatabase(DetachDatabaseStatement { schema_name }))
+            }
+            Token::Vacuum => {
+                self.advance();
+                Ok(Statement::Vacuum)
             }
             _ => Err(self.error(format!(
                 "unexpected token at start of statement: {:?}",
@@ -825,6 +854,8 @@ impl Parser {
         let mut not_null = false;
         let mut unique = false;
         let mut default = None;
+        let mut collation = None;
+        let mut generated = None;
 
         // Column constraints
         loop {
@@ -900,7 +931,47 @@ impl Parser {
                 }
                 Token::Collate => {
                     self.advance();
-                    let _collation = self.expect_identifier()?;
+                    collation = Some(self.expect_identifier()?);
+                }
+                // GENERATED ALWAYS AS (expr) STORED|VIRTUAL
+                Token::Generated => {
+                    self.advance();
+                    // Optional ALWAYS keyword
+                    if self.current() == &Token::Always {
+                        self.advance();
+                    }
+                    self.expect(&Token::As)?;
+                    self.expect(&Token::LeftParen)?;
+                    let gen_expr = self.parse_expr()?;
+                    self.expect(&Token::RightParen)?;
+                    let stored = if self.current() == &Token::Stored {
+                        self.advance();
+                        true
+                    } else if self.current() == &Token::Virtual {
+                        self.advance();
+                        false
+                    } else {
+                        // Default to VIRTUAL per SQL standard
+                        false
+                    };
+                    generated = Some(GeneratedColumn { expr: gen_expr, stored });
+                }
+                // AS (expr) STORED|VIRTUAL  -- shorthand for generated columns
+                Token::As if self.peek_ahead(1) == &Token::LeftParen => {
+                    self.advance(); // consume AS
+                    self.expect(&Token::LeftParen)?;
+                    let gen_expr = self.parse_expr()?;
+                    self.expect(&Token::RightParen)?;
+                    let stored = if self.current() == &Token::Stored {
+                        self.advance();
+                        true
+                    } else if self.current() == &Token::Virtual {
+                        self.advance();
+                        false
+                    } else {
+                        false
+                    };
+                    generated = Some(GeneratedColumn { expr: gen_expr, stored });
                 }
                 _ => break,
             }
@@ -914,6 +985,8 @@ impl Parser {
             not_null,
             unique,
             default,
+            collation,
+            generated,
         })
     }
 
@@ -1610,8 +1683,22 @@ impl Parser {
                     expr: Box::new(expr),
                 })
             }
-            _ => self.parse_primary_expr(),
+            _ => self.parse_postfix_expr(),
         }
+    }
+
+    fn parse_postfix_expr(&mut self) -> Result<Expr> {
+        let mut expr = self.parse_primary_expr()?;
+        // COLLATE collation_name
+        if self.current() == &Token::Collate {
+            self.advance();
+            let collation = self.expect_identifier()?;
+            expr = Expr::Collate {
+                expr: Box::new(expr),
+                collation,
+            };
+        }
+        Ok(expr)
     }
 
     fn parse_primary_expr(&mut self) -> Result<Expr> {

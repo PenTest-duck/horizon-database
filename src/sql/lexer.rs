@@ -126,6 +126,10 @@ pub enum Token {
     Instead,
     For,
     Of,
+    Generated,
+    Always,
+    Stored,
+    Virtual,
 
     // -----------------------------------------------------------------------
     // Literals
@@ -296,6 +300,10 @@ fn keyword_token(word: &str) -> Option<Token> {
         "INSTEAD" => Some(Token::Instead),
         "FOR" => Some(Token::For),
         "OF" => Some(Token::Of),
+        "GENERATED" => Some(Token::Generated),
+        "ALWAYS" => Some(Token::Always),
+        "STORED" => Some(Token::Stored),
+        "VIRTUAL" => Some(Token::Virtual),
         _ => None,
     }
 }
