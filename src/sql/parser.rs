@@ -154,9 +154,11 @@ impl Parser {
             Token::Delete => self.parse_delete(),
             Token::Create => self.parse_create(),
             Token::Drop => self.parse_drop(),
+            Token::Alter => self.parse_alter_table(),
+            Token::Explain => self.parse_explain(),
+            Token::Pragma => self.parse_pragma(),
             Token::Begin => {
                 self.advance();
-                // Optional TRANSACTION keyword.
                 if self.current() == &Token::Transaction {
                     self.advance();
                 }
@@ -1453,6 +1455,103 @@ impl Parser {
         }
         Ok(exprs)
     }
+
+    // =======================================================================
+    // ALTER TABLE
+    // =======================================================================
+
+    fn parse_alter_table(&mut self) -> Result<Statement> {
+        self.expect(&Token::Alter)?;
+        self.expect(&Token::Table)?;
+        let table = self.expect_identifier()?;
+
+        let action = if self.current() == &Token::Add {
+            self.advance();
+            // Optional COLUMN keyword
+            if self.current() == &Token::Column {
+                self.advance();
+            }
+            let col = self.parse_column_def()?;
+            AlterTableAction::AddColumn(col)
+        } else if self.current() == &Token::Rename {
+            self.advance();
+            if self.current() == &Token::Column {
+                // ALTER TABLE t RENAME COLUMN old TO new
+                self.advance();
+                let old_name = self.expect_identifier()?;
+                self.expect(&Token::To)?;
+                let new_name = self.expect_identifier()?;
+                AlterTableAction::RenameColumn { old_name, new_name }
+            } else if self.current() == &Token::To {
+                // ALTER TABLE t RENAME TO new_name
+                self.advance();
+                let new_name = self.expect_identifier()?;
+                AlterTableAction::RenameTable(new_name)
+            } else {
+                // ALTER TABLE t RENAME old TO new
+                let old_name = self.expect_identifier()?;
+                self.expect(&Token::To)?;
+                let new_name = self.expect_identifier()?;
+                AlterTableAction::RenameColumn { old_name, new_name }
+            }
+        } else if self.current() == &Token::Drop {
+            self.advance();
+            // Optional COLUMN keyword
+            if self.current() == &Token::Column {
+                self.advance();
+            }
+            let col_name = self.expect_identifier()?;
+            AlterTableAction::DropColumn(col_name)
+        } else {
+            return Err(self.error(format!(
+                "expected ADD, RENAME, or DROP after ALTER TABLE, got {:?}",
+                self.current()
+            )));
+        };
+
+        Ok(Statement::AlterTable(AlterTableStatement { table, action }))
+    }
+
+    // =======================================================================
+    // EXPLAIN
+    // =======================================================================
+
+    fn parse_explain(&mut self) -> Result<Statement> {
+        self.expect(&Token::Explain)?;
+        // Optional QUERY PLAN
+        if self.current() == &Token::Query {
+            self.advance();
+            // Expect PLAN
+            if self.current() == &Token::Plan {
+                self.advance();
+            }
+        }
+        let inner = self.parse_statement()?;
+        Ok(Statement::Explain(Box::new(inner)))
+    }
+
+    // =======================================================================
+    // PRAGMA
+    // =======================================================================
+
+    fn parse_pragma(&mut self) -> Result<Statement> {
+        self.expect(&Token::Pragma)?;
+        let name = self.expect_identifier()?;
+
+        let value = if self.current() == &Token::Eq {
+            self.advance();
+            Some(self.parse_expr()?)
+        } else if self.current() == &Token::LeftParen {
+            self.advance();
+            let val = self.parse_expr()?;
+            self.expect(&Token::RightParen)?;
+            Some(val)
+        } else {
+            None
+        };
+
+        Ok(Statement::Pragma(PragmaStatement { name, value }))
+    }
 }
 
 // ===========================================================================
@@ -2122,6 +2221,149 @@ mod tests {
                     panic!("expected BinaryOp Add");
                 }
             }
+        }
+    }
+
+    // =======================================================================
+    // ALTER TABLE tests
+    // =======================================================================
+
+    #[test]
+    fn parse_alter_table_add_column() {
+        let stmt = parse_one("ALTER TABLE users ADD COLUMN email TEXT");
+        if let Statement::AlterTable(alt) = stmt {
+            assert_eq!(alt.table, "users");
+            if let AlterTableAction::AddColumn(col) = alt.action {
+                assert_eq!(col.name, "email");
+                assert_eq!(col.type_name.as_deref(), Some("TEXT"));
+            } else {
+                panic!("expected AddColumn");
+            }
+        } else {
+            panic!("expected AlterTable");
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_add_column_no_keyword() {
+        let stmt = parse_one("ALTER TABLE users ADD name TEXT NOT NULL");
+        if let Statement::AlterTable(alt) = stmt {
+            assert_eq!(alt.table, "users");
+            if let AlterTableAction::AddColumn(col) = alt.action {
+                assert_eq!(col.name, "name");
+                assert!(col.not_null);
+            } else {
+                panic!("expected AddColumn");
+            }
+        } else {
+            panic!("expected AlterTable");
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_rename() {
+        let stmt = parse_one("ALTER TABLE users RENAME TO people");
+        if let Statement::AlterTable(alt) = stmt {
+            assert_eq!(alt.table, "users");
+            if let AlterTableAction::RenameTable(new) = alt.action {
+                assert_eq!(new, "people");
+            } else {
+                panic!("expected RenameTable");
+            }
+        } else {
+            panic!("expected AlterTable");
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_rename_column() {
+        let stmt = parse_one("ALTER TABLE users RENAME COLUMN name TO full_name");
+        if let Statement::AlterTable(alt) = stmt {
+            assert_eq!(alt.table, "users");
+            if let AlterTableAction::RenameColumn { old_name, new_name } = alt.action {
+                assert_eq!(old_name, "name");
+                assert_eq!(new_name, "full_name");
+            } else {
+                panic!("expected RenameColumn");
+            }
+        } else {
+            panic!("expected AlterTable");
+        }
+    }
+
+    #[test]
+    fn parse_alter_table_drop_column() {
+        let stmt = parse_one("ALTER TABLE users DROP COLUMN email");
+        if let Statement::AlterTable(alt) = stmt {
+            assert_eq!(alt.table, "users");
+            if let AlterTableAction::DropColumn(col) = alt.action {
+                assert_eq!(col, "email");
+            } else {
+                panic!("expected DropColumn");
+            }
+        } else {
+            panic!("expected AlterTable");
+        }
+    }
+
+    // =======================================================================
+    // EXPLAIN tests
+    // =======================================================================
+
+    #[test]
+    fn parse_explain_select() {
+        let stmt = parse_one("EXPLAIN SELECT * FROM users");
+        if let Statement::Explain(inner) = stmt {
+            assert!(matches!(*inner, Statement::Select(_)));
+        } else {
+            panic!("expected Explain");
+        }
+    }
+
+    #[test]
+    fn parse_explain_query_plan() {
+        let stmt = parse_one("EXPLAIN QUERY PLAN SELECT * FROM users WHERE id = 1");
+        if let Statement::Explain(inner) = stmt {
+            assert!(matches!(*inner, Statement::Select(_)));
+        } else {
+            panic!("expected Explain");
+        }
+    }
+
+    // =======================================================================
+    // PRAGMA tests
+    // =======================================================================
+
+    #[test]
+    fn parse_pragma_no_value() {
+        let stmt = parse_one("PRAGMA table_info");
+        if let Statement::Pragma(p) = stmt {
+            assert_eq!(p.name, "table_info");
+            assert!(p.value.is_none());
+        } else {
+            panic!("expected Pragma");
+        }
+    }
+
+    #[test]
+    fn parse_pragma_with_eq_value() {
+        let stmt = parse_one("PRAGMA journal_mode = WAL");
+        if let Statement::Pragma(p) = stmt {
+            assert_eq!(p.name, "journal_mode");
+            assert!(p.value.is_some());
+        } else {
+            panic!("expected Pragma");
+        }
+    }
+
+    #[test]
+    fn parse_pragma_with_paren_value() {
+        let stmt = parse_one("PRAGMA page_size(4096)");
+        if let Statement::Pragma(p) = stmt {
+            assert_eq!(p.name, "page_size");
+            assert!(p.value.is_some());
+        } else {
+            panic!("expected Pragma");
         }
     }
 }

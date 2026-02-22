@@ -26,6 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use crate::error::{HorizonError, Result};
+use crate::pager::PageId;
 
 /// Transaction isolation level.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -152,6 +153,42 @@ impl RowVersion {
     }
 }
 
+/// An undo log entry that records what to do to reverse a mutation.
+#[derive(Debug, Clone)]
+pub enum UndoEntry {
+    /// A key was inserted into a B+Tree — to undo, delete it.
+    Insert {
+        /// The table name this entry belongs to.
+        table: String,
+        /// The root page of the B+Tree at the time of the insert.
+        root_page: PageId,
+        /// The key that was inserted.
+        key: Vec<u8>,
+    },
+    /// A key was deleted from a B+Tree — to undo, re-insert it.
+    Delete {
+        /// The table name this entry belongs to.
+        table: String,
+        /// The root page of the B+Tree at the time of the delete.
+        root_page: PageId,
+        /// The key that was deleted.
+        key: Vec<u8>,
+        /// The value that was stored before deletion.
+        old_value: Vec<u8>,
+    },
+    /// A key was updated in a B+Tree — to undo, restore old value.
+    Update {
+        /// The table name this entry belongs to.
+        table: String,
+        /// The root page of the B+Tree at the time of the update.
+        root_page: PageId,
+        /// The key that was updated.
+        key: Vec<u8>,
+        /// The old value before the update.
+        old_value: Vec<u8>,
+    },
+}
+
 /// The transaction manager tracks active transactions and provides MVCC
 /// semantics.
 ///
@@ -163,6 +200,11 @@ pub struct TransactionManager {
     next_txn_id: AtomicU64,
     /// Mapping from transaction ID to its current state.
     active_txns: HashMap<TxnId, TxnState>,
+    /// Whether there is an explicit user transaction currently in progress.
+    user_txn_active: bool,
+    /// Undo log for the current explicit user transaction.
+    /// Entries are appended during mutations and replayed in reverse on ROLLBACK.
+    undo_log: Vec<UndoEntry>,
 }
 
 impl TransactionManager {
@@ -173,6 +215,8 @@ impl TransactionManager {
         TransactionManager {
             next_txn_id: AtomicU64::new(1),
             active_txns: HashMap::new(),
+            user_txn_active: false,
+            undo_log: Vec::new(),
         }
     }
 
@@ -246,6 +290,60 @@ impl TransactionManager {
         let id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
         self.active_txns.insert(id, TxnState::Committed);
         id
+    }
+
+    /// Begin an explicit user transaction. Returns an error if one is
+    /// already active.
+    pub fn begin_user_txn(&mut self) -> Result<()> {
+        if self.user_txn_active {
+            return Err(HorizonError::TransactionError(
+                "a transaction is already active".into(),
+            ));
+        }
+        self.user_txn_active = true;
+        self.undo_log.clear();
+        Ok(())
+    }
+
+    /// Commit the current explicit user transaction. The undo log is
+    /// discarded because changes are now permanent.
+    pub fn commit_user_txn(&mut self) -> Result<()> {
+        if !self.user_txn_active {
+            return Err(HorizonError::TransactionError(
+                "no active transaction to commit".into(),
+            ));
+        }
+        self.user_txn_active = false;
+        self.undo_log.clear();
+        Ok(())
+    }
+
+    /// Roll back the current explicit user transaction. Returns the undo
+    /// log entries so the caller can reverse the mutations.
+    pub fn rollback_user_txn(&mut self) -> Result<Vec<UndoEntry>> {
+        if !self.user_txn_active {
+            return Err(HorizonError::TransactionError(
+                "no active transaction to rollback".into(),
+            ));
+        }
+        self.user_txn_active = false;
+        // Return entries in reverse order for proper undo
+        let mut entries = std::mem::take(&mut self.undo_log);
+        entries.reverse();
+        Ok(entries)
+    }
+
+    /// Check whether an explicit user transaction is currently active.
+    pub fn is_user_txn_active(&self) -> bool {
+        self.user_txn_active
+    }
+
+    /// Record an undo entry for the current explicit user transaction.
+    /// If no user transaction is active this is a no-op (auto-commit mode).
+    pub fn record_undo(&mut self, entry: UndoEntry) {
+        if self.user_txn_active {
+            self.undo_log.push(entry);
+        }
     }
 }
 

@@ -15,6 +15,9 @@ pub enum Statement {
     DropTable(DropTableStatement),
     CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
+    AlterTable(AlterTableStatement),
+    Explain(Box<Statement>),
+    Pragma(PragmaStatement),
     Begin,
     Commit,
     Rollback,
@@ -147,6 +150,29 @@ pub struct CreateIndexStatement {
 pub struct DropIndexStatement {
     pub name: String,
     pub if_exists: bool,
+}
+
+/// An `ALTER TABLE` statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableStatement {
+    pub table: String,
+    pub action: AlterTableAction,
+}
+
+/// The specific alteration to apply to a table.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTableAction {
+    AddColumn(ColumnDef),
+    RenameTable(String),
+    RenameColumn { old_name: String, new_name: String },
+    DropColumn(String),
+}
+
+/// A `PRAGMA` statement — SQLite-compatible configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PragmaStatement {
+    pub name: String,
+    pub value: Option<Expr>,
 }
 
 // ---------------------------------------------------------------------------

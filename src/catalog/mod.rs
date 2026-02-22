@@ -242,6 +242,17 @@ impl Catalog {
         Ok(())
     }
 
+    /// Remove an index from the catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HorizonError::IndexNotFound`] if the index does not exist.
+    pub fn drop_index(&mut self, _pool: &mut BufferPool, name: &str) -> Result<IndexInfo> {
+        let index = self.indexes.remove(name)
+            .ok_or_else(|| HorizonError::IndexNotFound(name.into()))?;
+        Ok(index)
+    }
+
     /// Get an immutable reference to an index's metadata.
     ///
     /// # Errors
