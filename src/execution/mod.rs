@@ -986,6 +986,10 @@ fn execute_select_body_inner(
         let rows = result.rows.into_iter().map(|r| r.values).collect();
         return Ok((col_names, rows));
     }
+    // COUNT(*) fast path: use BTree::count() instead of scanning all rows
+    if let Some(count_result) = try_count_star_fast_path(select, pool, catalog)? {
+        return Ok(count_result);
+    }
     let needs_plan = matches!(&select.from, Some(FromClause::Join { .. }))
         || !select.group_by.is_empty() || select.having.is_some()
         || select_has_aggregate(&select.columns);
@@ -1035,11 +1039,9 @@ fn execute_select_body_inner(
     }
     let table = catalog.get_table(&table_name)?.clone();
     let data_tree = BTree::open(table.root_page);
-    let entries = if let Some(ref where_clause) = select.where_clause {
-        if let Some(index_entries) = try_index_scan(where_clause, &table_name, &table, pool, catalog)? {
-            index_entries
-        } else { data_tree.scan_all(pool)? }
-    } else { data_tree.scan_all(pool)? };
+    let entries = scan_with_index(
+        select.where_clause.as_ref(), &table_name, &table, &data_tree, pool, catalog,
+    )?;
     let column_names = resolve_column_names(&select.columns, &table)?;
     let has_virtual = table_has_virtual_columns(&table);
     let mut rows = Vec::new();
@@ -1360,6 +1362,61 @@ fn sort_rows_by_index(rows: &mut [Row], order_by: &[OrderByItem], col_names: &[S
         std::cmp::Ordering::Equal
     });
     Ok(())
+}
+
+/// Fast path for `SELECT COUNT(*) FROM table` with no WHERE, GROUP BY, HAVING,
+/// DISTINCT, JOINs, or compound queries. Uses BTree::count() which traverses
+/// leaf pages counting entries without deserializing any row data.
+fn try_count_star_fast_path(
+    select: &SelectStatement,
+    pool: &mut BufferPool,
+    catalog: &mut Catalog,
+) -> Result<Option<(Vec<String>, Vec<Vec<Value>>)>> {
+    // Must be a single table, no WHERE, no GROUP BY, no HAVING, no DISTINCT, no compound
+    if select.where_clause.is_some() || !select.group_by.is_empty()
+        || select.having.is_some() || select.distinct || !select.compound.is_empty() {
+        return Ok(None);
+    }
+    // Must have exactly one column: COUNT(*)
+    if select.columns.len() != 1 {
+        return Ok(None);
+    }
+    let is_count_star = match &select.columns[0] {
+        SelectColumn::Expr { expr, .. } => match expr {
+            Expr::Function { name, args, .. } => {
+                name.eq_ignore_ascii_case("count")
+                    && args.len() == 1
+                    && matches!(&args[0], Expr::Column { name: col_name, .. } if col_name == "*")
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if !is_count_star {
+        return Ok(None);
+    }
+    // Must be FROM a single real table (not a join, subquery, or virtual table)
+    let table_name = match &select.from {
+        Some(FromClause::Table { name, .. }) => name.clone(),
+        _ => return Ok(None),
+    };
+    // Skip virtual tables
+    if fts5::fts5_table_exists(&table_name) || catalog.rtree_exists(&table_name) {
+        return Ok(None);
+    }
+    // Skip views
+    if !catalog.table_exists(&table_name) {
+        return Ok(None);
+    }
+    let table = catalog.get_table(&table_name)?;
+    let tree = BTree::open(table.root_page);
+    let count = tree.count(pool)? as i64;
+
+    let col_name = match &select.columns[0] {
+        SelectColumn::Expr { alias: Some(a), .. } => a.clone(),
+        _ => "COUNT(*)".to_string(),
+    };
+    Ok(Some((vec![col_name], vec![vec![Value::Integer(count)]])))
 }
 
 /// Check if any select columns contain aggregate function calls.
@@ -1844,7 +1901,57 @@ fn execute_plan_rows(
     }
 }
 
-// ---- JOIN Execution (Nested Loop Join) ----
+// ---- JOIN Execution (Hash Join + Nested Loop fallback) ----
+
+/// Try to extract equi-join key column indices from an ON expression like `a.col = b.col`.
+/// Returns (left_key_idx, right_key_idx) as indices into the merged column list,
+/// where right_key_idx is relative to right_cols (i.e. adjusted by subtracting left_cols.len()).
+fn extract_equi_join_keys(
+    on_expr: &Expr,
+    left_cols: &[String],
+    right_cols: &[String],
+) -> Option<(usize, usize)> {
+    if let Expr::BinaryOp { left, op: BinaryOp::Eq, right } = on_expr {
+        if let (Expr::Column { name: ln, table: lt, .. }, Expr::Column { name: rn, table: rt, .. }) =
+            (left.as_ref(), right.as_ref())
+        {
+            // Try both orderings: left=left_table, right=right_table AND reversed
+            if let Some(pair) = match_join_cols(ln, lt, rn, rt, left_cols, right_cols) {
+                return Some(pair);
+            }
+            if let Some(pair) = match_join_cols(rn, rt, ln, lt, left_cols, right_cols) {
+                return Some(pair);
+            }
+        }
+    }
+    None
+}
+
+/// Match column names to left/right column lists, using suffix matching for qualified names.
+fn match_join_cols(
+    left_name: &str, _left_table: &Option<String>,
+    right_name: &str, _right_table: &Option<String>,
+    left_cols: &[String], right_cols: &[String],
+) -> Option<(usize, usize)> {
+    let left_idx = find_col_index(left_name, left_cols)?;
+    let right_idx = find_col_index(right_name, right_cols)?;
+    Some((left_idx, right_idx))
+}
+
+/// Find a column index by name, supporting both unqualified and qualified (table.col) names.
+fn find_col_index(name: &str, cols: &[String]) -> Option<usize> {
+    // Exact match first
+    if let Some(idx) = cols.iter().position(|c| c.eq_ignore_ascii_case(name)) {
+        return Some(idx);
+    }
+    // Suffix match: "table.col" matches "col" in the column list, or
+    // "col" matches "table.col" in the column list
+    let unqualified = name.rsplit('.').next().unwrap_or(name);
+    cols.iter().position(|c| {
+        let c_unqualified = c.rsplit('.').next().unwrap_or(c);
+        c_unqualified.eq_ignore_ascii_case(unqualified)
+    })
+}
 
 fn execute_join(
     left: &LogicalPlan,
@@ -1860,13 +1967,24 @@ fn execute_join(
     let num_right = right_cols.len();
     let num_left = left_cols.len();
 
-    // Merged column names: left columns followed by right columns
     let mut merged_cols = left_cols.clone();
     merged_cols.extend(right_cols.clone());
 
+    // Try hash join for equi-join conditions (not CROSS joins)
+    if !matches!(join_type, JoinType::Cross) {
+        if let Some(ref on_expr) = on {
+            if let Some((left_key_idx, right_key_idx)) = extract_equi_join_keys(on_expr, &left_cols, &right_cols) {
+                return execute_hash_join(
+                    &left_rows, &right_rows, left_key_idx, right_key_idx,
+                    num_left, num_right, join_type, &merged_cols,
+                );
+            }
+        }
+    }
+
+    // Fallback: nested-loop join
     let null_right: Vec<Value> = vec![Value::Null; num_right];
     let null_left: Vec<Value> = vec![Value::Null; num_left];
-
     let mut result = Vec::new();
 
     match join_type {
@@ -1877,15 +1995,12 @@ fn execute_join(
                     merged.extend(r_row.iter().cloned());
                     if let Some(ref on_expr) = on {
                         let val = eval_expr_dynamic(on_expr, &merged, &merged_cols)?;
-                        if !val.to_bool() {
-                            continue;
-                        }
+                        if !val.to_bool() { continue; }
                     }
                     result.push(merged);
                 }
             }
         }
-
         JoinType::Left => {
             for l_row in &left_rows {
                 let mut matched = false;
@@ -1894,9 +2009,7 @@ fn execute_join(
                     merged.extend(r_row.iter().cloned());
                     if let Some(ref on_expr) = on {
                         let val = eval_expr_dynamic(on_expr, &merged, &merged_cols)?;
-                        if !val.to_bool() {
-                            continue;
-                        }
+                        if !val.to_bool() { continue; }
                     }
                     matched = true;
                     result.push(merged);
@@ -1908,7 +2021,6 @@ fn execute_join(
                 }
             }
         }
-
         JoinType::Right => {
             for r_row in &right_rows {
                 let mut matched = false;
@@ -1917,9 +2029,7 @@ fn execute_join(
                     merged.extend(r_row.iter().cloned());
                     if let Some(ref on_expr) = on {
                         let val = eval_expr_dynamic(on_expr, &merged, &merged_cols)?;
-                        if !val.to_bool() {
-                            continue;
-                        }
+                        if !val.to_bool() { continue; }
                     }
                     matched = true;
                     result.push(merged);
@@ -1931,7 +2041,6 @@ fn execute_join(
                 }
             }
         }
-
         JoinType::Cross => {
             for l_row in &left_rows {
                 for r_row in &right_rows {
@@ -1944,6 +2053,104 @@ fn execute_join(
     }
 
     Ok((merged_cols, result))
+}
+
+/// Hash join implementation for equi-join conditions.
+/// Builds a HashMap on the smaller side for O(n+m) join instead of O(n*m).
+fn execute_hash_join(
+    left_rows: &[Vec<Value>],
+    right_rows: &[Vec<Value>],
+    left_key_idx: usize,
+    right_key_idx: usize,
+    num_left: usize,
+    num_right: usize,
+    join_type: &JoinType,
+    _merged_cols: &[String],
+) -> Result<(Vec<String>, Vec<Vec<Value>>)> {
+    let null_right: Vec<Value> = vec![Value::Null; num_right];
+    let null_left: Vec<Value> = vec![Value::Null; num_left];
+    let mut result = Vec::new();
+
+    match join_type {
+        JoinType::Inner => {
+            // Build hash table on right side
+            let mut hash_map: HashMap<Value, Vec<usize>> = HashMap::new();
+            for (i, row) in right_rows.iter().enumerate() {
+                let key = &row[right_key_idx];
+                if !key.is_null() {
+                    hash_map.entry(key.clone()).or_default().push(i);
+                }
+            }
+            // Probe with left side
+            for l_row in left_rows {
+                let key = &l_row[left_key_idx];
+                if key.is_null() { continue; }
+                if let Some(matches) = hash_map.get(key) {
+                    for &ri in matches {
+                        let mut merged = l_row.clone();
+                        merged.extend(right_rows[ri].iter().cloned());
+                        result.push(merged);
+                    }
+                }
+            }
+        }
+        JoinType::Left => {
+            // Build hash table on right side
+            let mut hash_map: HashMap<Value, Vec<usize>> = HashMap::new();
+            for (i, row) in right_rows.iter().enumerate() {
+                let key = &row[right_key_idx];
+                if !key.is_null() {
+                    hash_map.entry(key.clone()).or_default().push(i);
+                }
+            }
+            // Probe with left side
+            for l_row in left_rows {
+                let key = &l_row[left_key_idx];
+                let matches = if key.is_null() { None } else { hash_map.get(key) };
+                if let Some(matches) = matches {
+                    for &ri in matches {
+                        let mut merged = l_row.clone();
+                        merged.extend(right_rows[ri].iter().cloned());
+                        result.push(merged);
+                    }
+                } else {
+                    let mut merged = l_row.clone();
+                    merged.extend(null_right.iter().cloned());
+                    result.push(merged);
+                }
+            }
+        }
+        JoinType::Right => {
+            // Build hash table on left side, probe with right
+            let mut hash_map: HashMap<Value, Vec<usize>> = HashMap::new();
+            for (i, row) in left_rows.iter().enumerate() {
+                let key = &row[left_key_idx];
+                if !key.is_null() {
+                    hash_map.entry(key.clone()).or_default().push(i);
+                }
+            }
+            for r_row in right_rows {
+                let key = &r_row[right_key_idx];
+                let matches = if key.is_null() { None } else { hash_map.get(key) };
+                if let Some(matches) = matches {
+                    for &li in matches {
+                        let mut merged = left_rows[li].clone();
+                        merged.extend(r_row.iter().cloned());
+                        result.push(merged);
+                    }
+                } else {
+                    let mut merged = null_left.clone();
+                    merged.extend(r_row.iter().cloned());
+                    result.push(merged);
+                }
+            }
+        }
+        JoinType::Cross => {
+            unreachable!("CROSS JOIN should not reach hash join path");
+        }
+    }
+
+    Ok((_merged_cols.to_vec(), result))
 }
 
 // ---- Aggregate + Project Execution ----
@@ -3650,6 +3857,125 @@ fn execute_select_no_from(select: &SelectStatement) -> Result<QueryResult> {
     Ok(QueryResult { columns, rows })
 }
 
+// ---- UNIFIED SCAN WITH INDEX ----
+
+/// Scan entries from a table using the best available method:
+/// 1. Primary key seek (for INTEGER PK equality/range)
+/// 2. Secondary index scan
+/// 3. Full table scan (fallback)
+fn scan_with_index(
+    where_clause: Option<&Expr>,
+    table_name: &str,
+    table: &TableInfo,
+    tree: &BTree,
+    pool: &mut BufferPool,
+    catalog: &Catalog,
+) -> Result<Vec<crate::btree::BTreeEntry>> {
+    if let Some(where_expr) = where_clause {
+        if let Some(pk_entries) = try_pk_seek(where_expr, table, tree, pool)? {
+            return Ok(pk_entries);
+        }
+        if let Some(index_entries) = try_index_scan(where_expr, table_name, table, pool, catalog)? {
+            return Ok(index_entries);
+        }
+    }
+    tree.scan_all(pool)
+}
+
+// ---- PRIMARY KEY SEEK ----
+
+/// Attempt to use the primary key B+Tree directly for point lookups and range scans.
+/// For INTEGER PRIMARY KEY tables, the data B+Tree key *is* the rowid, so we can
+/// use BTree::search() for O(log n) exact lookups instead of scanning all rows.
+fn try_pk_seek(
+    where_clause: &Expr,
+    table: &TableInfo,
+    tree: &BTree,
+    pool: &mut BufferPool,
+) -> Result<Option<Vec<crate::btree::BTreeEntry>>> {
+    let pk_idx = match table.pk_column {
+        Some(idx) => idx,
+        None => return Ok(None),
+    };
+    let pk_col = &table.columns[pk_idx];
+    if pk_col.affinity != DataType::Integer {
+        return Ok(None);
+    }
+    let pk_name = &pk_col.name;
+
+    // Try to extract a PK predicate from the WHERE clause
+    if let Some(entries) = try_pk_predicate(where_clause, pk_name, tree, pool)? {
+        return Ok(Some(entries));
+    }
+
+    // Try to extract PK = N from an AND chain (e.g. `id = 5 AND name = 'foo'`)
+    if let Expr::BinaryOp { left, op: BinaryOp::And, right } = where_clause {
+        if let Some(entries) = try_pk_predicate(left, pk_name, tree, pool)? {
+            return Ok(Some(entries));
+        }
+        if let Some(entries) = try_pk_predicate(right, pk_name, tree, pool)? {
+            return Ok(Some(entries));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Try to match a single expression against `pk_col = N` or range patterns.
+fn try_pk_predicate(
+    expr: &Expr,
+    pk_name: &str,
+    tree: &BTree,
+    pool: &mut BufferPool,
+) -> Result<Option<Vec<crate::btree::BTreeEntry>>> {
+    let (col_name, op, val) = match extract_index_predicate(expr) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    if !col_name.eq_ignore_ascii_case(pk_name) {
+        // Also handle qualified names like "table.id"
+        let unqualified = col_name.rsplit('.').next().unwrap_or(&col_name);
+        if !unqualified.eq_ignore_ascii_case(pk_name) {
+            return Ok(None);
+        }
+    }
+    let rowid = match &val {
+        Value::Integer(n) => *n,
+        _ => return Ok(None),
+    };
+
+    match op {
+        BinaryOp::Eq => {
+            let key = rowid.to_be_bytes();
+            if let Some(data) = tree.search(pool, &key)? {
+                Ok(Some(vec![crate::btree::BTreeEntry { key: key.to_vec(), value: data }]))
+            } else {
+                Ok(Some(vec![]))
+            }
+        }
+        BinaryOp::Gt => {
+            let start_key = (rowid + 1).to_be_bytes();
+            Ok(Some(tree.scan_from(pool, &start_key)?))
+        }
+        BinaryOp::GtEq => {
+            let start_key = rowid.to_be_bytes();
+            Ok(Some(tree.scan_from(pool, &start_key)?))
+        }
+        BinaryOp::Lt => {
+            let end_key = rowid.to_be_bytes();
+            // Rowids are positive, so [0u8; 8] (rowid 0) is before all valid entries
+            let start_key = 0i64.to_be_bytes();
+            Ok(Some(tree.scan_range(pool, &start_key, &end_key)?))
+        }
+        BinaryOp::LtEq => {
+            let end_key = (rowid + 1).to_be_bytes();
+            let start_key = 0i64.to_be_bytes();
+            Ok(Some(tree.scan_range(pool, &start_key, &end_key)?))
+        }
+        _ => Ok(None),
+    }
+}
+
 // ---- INDEX SCAN ----
 
 /// Attempt to use an index to satisfy a WHERE clause predicate.
@@ -3809,7 +4135,7 @@ fn execute_update(
     // Fire BEFORE UPDATE triggers
     views_triggers::fire_triggers(&upd.table, &TriggerEventKind::Update, &TriggerTimingKind::Before, pool, catalog, txn_mgr)?;
 
-    let entries = tree.scan_all(pool)?;
+    let entries = scan_with_index(upd.where_clause.as_ref(), &upd.table, &table, &tree, pool, catalog)?;
     let mut updated = 0;
 
     for entry in &entries {
@@ -3947,7 +4273,7 @@ fn execute_delete(
     let table = catalog.get_table(&del.table)?.clone();
     let mut tree = BTree::open(table.root_page);
 
-    let entries = tree.scan_all(pool)?;
+    let entries = scan_with_index(del.where_clause.as_ref(), &del.table, &table, &tree, pool, catalog)?;
     let mut to_delete: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
 
     for entry in &entries {
@@ -4163,7 +4489,7 @@ fn execute_update_returning(
     let column_names = resolve_column_names(returning_cols, &table)?;
     let columns = Arc::new(column_names);
 
-    let entries = tree.scan_all(pool)?;
+    let entries = scan_with_index(upd.where_clause.as_ref(), &upd.table, &table, &tree, pool, catalog)?;
     let mut rows = Vec::new();
 
     for entry in &entries {
@@ -4226,7 +4552,7 @@ fn execute_delete_returning(
     let column_names = resolve_column_names(returning_cols, &table)?;
     let columns = Arc::new(column_names);
 
-    let entries = tree.scan_all(pool)?;
+    let entries = scan_with_index(del.where_clause.as_ref(), &del.table, &table, &tree, pool, catalog)?;
     let mut to_delete: Vec<(Vec<u8>, Vec<Value>)> = Vec::new();
 
     for entry in &entries {

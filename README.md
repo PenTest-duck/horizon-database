@@ -206,16 +206,48 @@ cargo bench
 
 ## Benchmarks
 
-22 Criterion benchmarks covering:
-- Insert throughput (100/1000 rows, multi-value, transactional)
-- Select performance (full scan, WHERE, LIKE, column projection)
-- ORDER BY, LIMIT, DISTINCT
-- Aggregates (COUNT, GROUP BY, SUM/MIN/MAX)
-- JOIN (100x500 rows, with WHERE filter)
-- Index lookup
-- UPDATE and DELETE
-- CTE, subquery IN, window functions
-- SQL parsing
+Performance comparison against SQLite (1000-row tables, Criterion.rs, WAL mode).
+
+### Highlights
+
+| Benchmark | Horizon DB | SQLite | Ratio |
+|-----------|-----------|--------|-------|
+| Point lookup (`WHERE id = N`) | 24 us | 17 us | 1.4x |
+| COUNT(*) | 5.4 us | 3.3 us | 1.7x |
+| INSERT 1000 rows | 33 ms | 36 ms | **0.9x (faster)** |
+| ORDER BY | 686 us | 354 us | 1.9x |
+| JOIN 100x500 | 509 us | 73 us | 7.0x |
+| UPDATE 100 rows | 6.1 ms | 1.0 ms | 6.2x |
+| DELETE 100 rows | 6.1 ms | 1.1 ms | 5.4x |
+
+### Full Results
+
+| Category | Benchmark | Horizon DB | SQLite | Ratio |
+|----------|-----------|-----------|--------|-------|
+| **Insert** | 100 rows (individual) | 10.95 ms | 6.24 ms | 1.8x |
+| | 1000 rows (individual) | 32.74 ms | 35.85 ms | **0.9x** |
+| | 100 rows (multi-value) | 8.50 ms | 3.97 ms | 2.1x |
+| | 1000 rows (transaction) | 27.13 ms | 2.97 ms | 9.1x |
+| **Select** | SELECT * (1000 rows) | 3.54 ms | 1.64 ms | 2.2x |
+| | WHERE id = 500 | 23.88 us | 16.62 us | 1.4x |
+| | WHERE id range | 1.22 ms | 14.69 us | 83x |
+| | WHERE LIKE | 872 us | 158 us | 5.5x |
+| | Column projection | 517 us | 57 us | 9.1x |
+| **Order/Distinct** | ORDER BY | 686 us | 354 us | 1.9x |
+| | ORDER BY LIMIT 10 | 576 us | 351 us | 1.6x |
+| | DISTINCT | 417 us | 126 us | 3.3x |
+| **Aggregate** | COUNT(*) | 5.44 us | 3.29 us | 1.7x |
+| | GROUP BY + COUNT + AVG | 2.21 ms | 586 us | 3.8x |
+| | SUM + MIN + MAX | 8.83 ms | 448 us | 19.7x |
+| **Join** | INNER JOIN 100x500 | 509 us | 73 us | 7.0x |
+| | JOIN + WHERE | 541 us | 64 us | 8.5x |
+| **Mutation** | UPDATE 100/1000 | 6.13 ms | 996 us | 6.2x |
+| | DELETE 100/1000 | 6.07 ms | 1.13 ms | 5.4x |
+| **Advanced** | CTE with filter | 808 us | 70 us | 11.5x |
+| | Subquery IN | 1.26 ms | 136 us | 9.3x |
+| | Window ROW_NUMBER | 1.16 ms | 833 us | 1.4x |
+
+See [docs/benchmarks.md](docs/benchmarks.md) for methodology and optimization details.
 
 ```bash
 cargo bench

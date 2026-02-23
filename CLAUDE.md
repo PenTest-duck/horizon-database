@@ -100,6 +100,10 @@ Page 1: Schema table root (B+Tree storing table/index metadata)
 Page 2+: Data pages (B+Tree internal/leaf nodes, overflow pages)
 ```
 
+## Benchmarks
+
+- When benchmark results change (after running `cargo bench`), update **both** `docs/benchmarks.md` and the Benchmarks section in `README.md` to keep them in sync.
+
 ## Documentation
 
 - [Architecture Deep Dive](docs/architecture.md)
